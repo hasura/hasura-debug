@@ -37,6 +37,7 @@ import qualified Data.IntMap as IM
 import Data.Bitraversable
 import Data.Monoid
 import Control.Applicative
+import Data.Traversable
 
 import System.Process
 import System.Environment
@@ -56,36 +57,97 @@ import GHC.Generics
 --      (can we elide these)
 
 -- Collect snapshot, stepping through so we have some control over memory usage:
-main = getArgs >>= \case
-  ("--analyze-snapshot":limDirty:mbFile) -> do
-    let file = case mbFile of
-                 [f] -> f
-                 []  -> "/tmp/ghc-debug-cache"
-                 _ -> error "bad args"
-    -- zero indicates no limit:
-    let limI = read limDirty
-        lim | limI == 0 = Nothing
-            | otherwise = Just limI
-    snapshotRun file $
-      pRetainingThunks
-      -- pDominators lim
+main = do 
+  hSetBuffering stdout NoBuffering 
+  getArgs >>= \case
+     ("--analyze-snapshot":limDirty:mbFile) -> do
+       let file = case mbFile of
+                    [f] -> f
+                    []  -> defaultSnapshotLocation
+                    _ -> error "bad args"
+       -- zero indicates no limit:
+       let limI = read limDirty
+           lim | limI == 0 = Nothing
+               | otherwise = Just limI
+       snapshotRun file $
+         -- pRetainingThunks
+         -- pDominators lim
+         pFragmentation
 
-  ("--take-snapshot":mbSocket) -> do
-    let sockPath = case mbSocket of
-          [] -> "/tmp/ghc-debug" 
-          [p] -> p
-          _ -> error "usage: --take-snapshot [<socket-path>]"
-    -- jank: just loop until this works:
-    F.for_ [1..50] $ \_ -> do
-      try (go sockPath) >>= \case
-        Left (_ :: SomeException) -> putStrLn "X" >> threadDelay 200_000
-        Right _ -> putStrLn "!!!CONNECTED!!!"
+     ("--take-snapshot":mbSocket) -> do
+       let sockPath = case mbSocket of
+             [] -> "/tmp/ghc-debug" 
+             [p] -> p
+             _ -> error "usage: --take-snapshot [<socket-path>]"
+       -- jank: just loop until this works:
+       let maxAttempts = (50 :: Int)
+           loop attempt = do
+             try (go sockPath) >>= \case
+               Left (e :: SomeException) 
+                 | otherwise -> print e>> threadDelay 200_000 >> loop (attempt+1)
+                 | attempt == maxAttempts -> do
+                     print e
+                     throw e
+                 | otherwise -> putStr "." >> threadDelay 200_000 >> loop (attempt+1)
+               Right _ -> do 
+                   putStrLn $ "Snapshot created at: "<>defaultSnapshotLocation
+       loop 1
 
-  _ -> error "bad args"
+     _ -> error "bad args"
   where
     go sockPath = withDebuggeeConnect sockPath $ \e -> do 
-      pSteppingSnapshot e
+      makeSnapshot e defaultSnapshotLocation
       outputRequestLog e
+
+-- See: https://well-typed.com/blog/2021/01/fragmentation-deeper-look/
+-- TODO optionally take a GC to compact non-pinned? Maybe no point to that
+pFragmentation :: Debuggee -> IO ()
+pFragmentation e = do
+  pause e
+  (bs, pinnedCensus, mblockCensus, blockCensus) <- run e $ do
+    bs <- precacheBlocks
+    roots <- gcRoots
+    pinnedCensus <- censusPinnedBlocks bs roots
+    mblockCensus <- censusByMBlock roots
+    blockCensus  <- censusByBlock roots
+    -- TODO can we do this outside of `run`, i.e. can `roots` leak?
+    let badPtrs = findBadPtrs pinnedCensus
+    forM_ badPtrs $ \x@((_,ptrs),l)-> do
+      liftIO $ print "=============== fragment object ========================================================"
+      -- Look for data with just a single retainer (although we need to limit
+      -- at 2 for that) which we are more likely to be able to do something
+      -- about:
+      rs <- findRetainersOf (Just 2) roots ptrs
+      case rs of
+        [ ] -> liftIO $ print "no retainers... why?"
+        [_,_] -> liftIO $ print "two retainers, skipping"
+        [r] -> do
+          cs <- dereferenceClosures r
+          cs' <- mapM (quadtraverse pure dereferenceConDesc pure pure) cs
+          locs <- mapM getSourceLoc cs'
+          -- displayRetainerStack is arbitrary and weird...
+          -- TODO could be cool to look for the last thunk in the list (highest up in retainer tree)
+          -- TODO would be cool to call out the top-most line from our own codebase too
+          liftIO $ displayRetainerStack 
+            [ ("", zip cs' locs) ]
+        _ -> error $ "findRetainersOf broken apparently"<>(show rs)
+
+    return (bs, pinnedCensus, mblockCensus, blockCensus)
+  resume e
+  
+  -- Output:
+  putStrLn "--------------------------------"
+  summariseBlocks bs
+  putStrLn "---------- mega-block histogram: --------------------------------"
+  printMBlockCensus mblockCensus
+  putStrLn "---------- block histogram: --------------------------------"
+  printBlockCensus blockCensus
+  putStrLn "---------- pinned block histogram: --------------------------------"
+  -- TODO is printBlockCensus correct for pinned? i.e. same size?
+  printBlockCensus $ fmap (\(PinnedCensusStats (censusStats, _))-> censusStats) pinnedCensus
+
+  putStrLn "--------------------------------"
+
 
 -- print thunks and their retained size (sort of...)
 pRetainingThunks :: Debuggee -> IO ()
@@ -402,8 +464,12 @@ pruneDownToPct p root@(Node x forrest) = Node x $ map go forrest
 
   -}
 
+defaultSnapshotLocation :: String
+defaultSnapshotLocation = "/tmp/ghc-debug-cache"
+
+-- Take snapshots in a loop forever, at intervals, overwriting.
 pSteppingSnapshot e = forM_ [0..] $ \i -> do
-  makeSnapshot e "/tmp/ghc-debug-cache"
+  makeSnapshot e defaultSnapshotLocation
   putStrLn ("CACHED: " ++ show i)
   threadDelay 5_000_000
 
@@ -423,4 +489,8 @@ emptyTraceFunctions =
      , conDescTrace = const (lift $ return ())
    }
 
+-- TODO add to ghc-debug
 deriving instance MonadIO DebugM
+
+getSourceLoc :: DebugClosureWithSize pap string s b -> DebugM (Maybe SourceInformation) 
+getSourceLoc c = getSourceInfo (tableId (info (noSize c)))
