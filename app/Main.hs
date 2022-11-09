@@ -11,7 +11,7 @@ import GHC.Debug.Dominators
 import GHC.Debug.Snapshot
 import GHC.Debug.Count
 import GHC.Debug.Types.Graph (heapGraphSize, traverseHeapGraph, ppClosure)
-import GHC.Debug.Types.Ptr (ClosurePtr(..))
+import GHC.Debug.Types.Ptr (ClosurePtr(..), InfoTablePtr(..))
 --import GHC.Debug.Types.Closures
 import GHC.Debug.Trace
 import GHC.Debug.ObjectEquiv
@@ -71,8 +71,8 @@ main = do
                | otherwise = Just limI
        snapshotRun file $
          -- pRetainingThunks
-         -- pDominators lim
-         pFragmentation
+         pDominators lim
+         -- pFragmentation
 
      ("--take-snapshot":mbSocket) -> do
        let sockPath = case mbSocket of
@@ -395,7 +395,7 @@ pDominators lim e = do
              in ((rs, s, t), tableId i)
       pure (fiddle <$> tree)
       
-    -- sort tree so largest retained sizes at top:
+    -- recursively sort tree so largest retained sizes at top:
     let sortTree (Node x xs) = Node x $ sortBy (flip compare `on` rootLabel) $ map sortTree xs
         
     -- For validating whether we've got close to the heap size we expect represented 
@@ -404,10 +404,11 @@ pDominators lim e = do
         totalRetainedMB = fromIntegral totalRetained / 1_000_000
     liftIO $ hPutStrLn stderr $ "!!! TOTAL SIZE RETAINED REPORTED: "<> show totalRetainedMB <> " MB"
 
-  -- {-
+    -- Sort just top-level
     let forrestSorted = sortBy (flip compare `on` rootLabel) forrest
+  {- TODO what was the goal here?
     -- descend until we're at 90% of peak
-    let limFactor = 0.0005
+    let limFactor = 0.2
     let rLimLower = case forrestSorted of
           (Node ((rBiggest,_,_),_) _ : _) -> round (fromIntegral rBiggest * limFactor)
           _ -> error "Blah"
@@ -420,15 +421,15 @@ pDominators lim e = do
               liftIO $ putStrLn $ drawTree $ fmap show nAnnotated
                 
     F.for_ forrestSorted $ goDescend . sortTree
-    -- -}
+    -}
     
-  {-
+  -- {-
     let tree0 =
           Node ((0,0,TSO), nullInfoTablePtr) $ --nonsense
-            forrest
+            forrestSorted
 
     -- let tree1 = topThunkClosures tree0
-    let tree1 = pruneDownToPct 0.05 tree0
+    let tree1 = pruneDownToPct 0.001 tree0
 
     -- Annotate all with source info
     tree2 <- forM tree1 $ traverse $ \tid -> 
@@ -438,10 +439,10 @@ pDominators lim e = do
 
     liftIO $ putStrLn $ drawTree $
       fmap show $ sortTree tree2
-      -}
+      -- -}
 
 
-    {-
+    -- {-
 -- Prune all grandchildren of thunks, for clarity/brevity:
 topThunkClosures :: Tree ((x, y, ClosureType), InfoTablePtr) -> Tree ((x, y, ClosureType), InfoTablePtr)
 topThunkClosures (Node n@((_, _, tp), _) forrest)
@@ -453,16 +454,16 @@ topThunkClosures (Node n@((_, _, tp), _) forrest)
 -- ...or alternatively, prune children with retained size under some magnitude:
 -- assumes reverse sorted tree by retained
 pruneDownToPct :: Float -> Tree ((Int, y, ClosureType), InfoTablePtr) -> Tree ((Int, y, ClosureType), InfoTablePtr)
-pruneDownToPct p root@(Node x forrest) = Node x $ map go forrest
+pruneDownToPct p root@(Node x forrest) = Node x $ mapMaybe go forrest
   where limLower = case forrest of
           (Node ((rBiggest,_,_),_) _ : _) -> round (fromIntegral rBiggest * p)
           _ -> error "Blah"
         
         go (Node n@((r,_,_),_) ns)
-          | r < limLower = Node n []
-          | otherwise = Node n $ map go ns
+          | r < limLower = Nothing
+          | otherwise = Just $ Node n $ mapMaybe go ns
 
-  -}
+  -- -}
 
 defaultSnapshotLocation :: String
 defaultSnapshotLocation = "/tmp/ghc-debug-cache"
@@ -474,8 +475,8 @@ pSteppingSnapshot e = forM_ [0..] $ \i -> do
   threadDelay 5_000_000
 
 -- TODO add to ghc-debug?
--- nullInfoTablePtr :: InfoTablePtr
--- nullInfoTablePtr = InfoTablePtr 0
+nullInfoTablePtr :: InfoTablePtr
+nullInfoTablePtr = InfoTablePtr 0
 
 
 -- TODO add to ghc-debug
