@@ -7,7 +7,7 @@ import GHC.Debug.Client.Monad.Simple (DebugM(..))
 import GHC.Debug.Retainers
 import GHC.Debug.Fragmentation
 import GHC.Debug.Profile
-import GHC.Debug.Dominators
+import GHC.Debug.Dominators (retainerSize)
 import GHC.Debug.Snapshot
 import GHC.Debug.Count
 import GHC.Debug.Types.Graph (heapGraphSize, traverseHeapGraph, ppClosure)
@@ -51,6 +51,7 @@ import Data.Function
 import Data.List.NonEmpty(NonEmpty(..))
 import Data.Function
 import GHC.Generics
+import GHC.Clock
 
 -- TODO analyses:
 --   - how many separate info_tables have identical SourceInformation ?
@@ -363,11 +364,13 @@ pDominators lim e = do
     roots <- gcRoots
     liftIO $ hPutStrLn stderr "!!!!! Done gcRoots !!!!!"
 
+    ns0 <- liftIO getMonotonicTime
     hg :: HeapGraph Size <- case roots of
       [] -> error "Empty roots"
       (x:xs) -> do
         multiBuildHeapGraph lim (x :| xs)
-    liftIO $ hPutStrLn stderr $ "!!!!! Done multiBuildHeapGraph !!!!!"
+    ns1 <- liftIO getMonotonicTime
+    liftIO $ hPutStrLn stderr $ "!!!!! Done multiBuildHeapGraph !!!!! in "<>(show $ (ns1-ns0))
 
     -- Validate that sizes in dominator tree seem right:
     let !sizeTot = IM.foldl' (\s e-> s + hgeData e) 0 $ graph hg
