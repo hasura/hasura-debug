@@ -1,3 +1,4 @@
+{-# OPTIONS_GHC -fno-warn-orphans #-}
 {-# LANGUAGE LambdaCase, RecordWildCards #-}
 module Main where
 
@@ -6,58 +7,63 @@ import GHC.Debug.Client.Monad hiding (DebugM)
 import GHC.Debug.Client.Monad.Simple (DebugM(..))
 import GHC.Debug.Retainers
 import GHC.Debug.Fragmentation
-import GHC.Debug.Profile
+-- import GHC.Debug.Profile
 import GHC.Debug.Dominators (retainerSize)
 import GHC.Debug.Snapshot
-import GHC.Debug.Count
-import GHC.Debug.Types.Graph (heapGraphSize, traverseHeapGraph, ppClosure)
-import GHC.Debug.Types.Ptr (ClosurePtr(..), InfoTablePtr(..))
+-- import GHC.Debug.Count
+-- import GHC.Debug.Types.Graph (heapGraphSize, traverseHeapGraph, ppClosure)
+import GHC.Debug.Types.Ptr
 --import GHC.Debug.Types.Closures
 import GHC.Debug.Trace
-import GHC.Debug.ObjectEquiv
+-- import GHC.Debug.ObjectEquiv
 import Control.Monad.RWS
-import Control.Monad.Identity
-import Control.Monad.Writer
-import qualified Data.ByteString.Char8 as B
-import qualified Data.ByteString.Builder as B
-import qualified Data.Text as T
-import qualified Data.Text.IO as T
+-- import Control.Monad.Identity
+-- import Control.Monad.Writer
+-- import qualified Data.ByteString.Char8 as B
+-- import qualified Data.ByteString.Builder as B
+-- import qualified Data.Text as T
+-- import qualified Data.Text.IO as T
 import Control.Monad.State
-import Data.Text (Text)
-import GHC.Exts.Heap.ClosureTypes
+-- import Data.Text (Text)
+-- import GHC.Exts.Heap.ClosureTypes
 import qualified Data.Foldable as F
 
-import Control.Monad
-import Debug.Trace
+-- import Control.Monad
+-- import Debug.Trace
 import Control.Exception
 import Control.Concurrent
-import Control.Concurrent.Async
+-- import Control.Concurrent.Async
 -- import qualified Control.Concurrent.Chan.Unagi.Bounded as Bounded
 import qualified Data.IntMap as IM
-import Data.Bitraversable
-import Data.Monoid
-import Control.Applicative
-import Data.Traversable
+-- import Data.Bitraversable
+-- import Data.Monoid
+-- import Control.Applicative
+-- import Data.Traversable
+import Data.Kind
 
-import System.Process
+-- import System.Process
 import System.Environment
 import System.IO
 import Data.Tree
 import Data.Maybe
 import qualified Data.Map as Map
-import Data.Ord
+-- import Data.Ord
 import Data.List
 import Data.Function
 import Data.List.NonEmpty(NonEmpty(..))
-import Data.Function
+-- import Data.Function
 import GHC.Generics
 import GHC.Clock
+
+import GHC.Int
+
 
 -- TODO analyses:
 --   - how many separate info_tables have identical SourceInformation ?
 --      (can we elide these)
 
 -- Collect snapshot, stepping through so we have some control over memory usage:
+main :: IO ()
 main = do 
   hSetBuffering stdout NoBuffering 
   getArgs >>= \case
@@ -85,7 +91,6 @@ main = do
            loop attempt = do
              try (go sockPath) >>= \case
                Left (e :: SomeException) 
-                 | otherwise -> print e>> threadDelay 200_000 >> loop (attempt+1)
                  | attempt == maxAttempts -> do
                      print e
                      throw e
@@ -113,7 +118,7 @@ pFragmentation e = do
     blockCensus  <- censusByBlock roots
     -- TODO can we do this outside of `run`, i.e. can `roots` leak?
     let badPtrs = findBadPtrs pinnedCensus
-    forM_ badPtrs $ \x@((_,ptrs),l)-> do
+    forM_ badPtrs $ \((_,ptrs),_l)-> do
       liftIO $ print "=============== fragment object ========================================================"
       -- Look for data with just a single retainer (although we need to limit
       -- at 2 for that) which we are more likely to be able to do something
@@ -160,7 +165,7 @@ pRetainingThunks e = do
     roots <- gcRoots
     liftIO $ hPutStrLn stderr "!!!!! Done gcRoots !!!!!"
 
-    (totSize,_) <- flip execStateT (0, 0) $ 
+    (totSize,_) <- flip execStateT (0, 0::Int) $ 
       traceFromM emptyTraceFunctions{closTrace = closTraceFunc} roots
 
     liftIO $ hPutStrLn stderr $ "!!!!! TOTAL SIZE: "<>show totSize
@@ -170,7 +175,7 @@ pRetainingThunks e = do
     -- want to report about?:
     thunkDepthLim = 10
 
-    closTraceFunc ptr (DCS size clos) continue = do
+    closTraceFunc _ptr (DCS size clos) continue = do
       (!sizeAcc, !thunkDepth) <- get
       mbSourceInfo <- lift $ getSourceInfo $ tableId $ info clos
       case mbSourceInfo of
@@ -337,7 +342,7 @@ data GMLPayload
 constrName :: (HasConstructor (Rep a), Generic a)=> a -> String
 constrName = genericConstrName . from 
 
-class HasConstructor (f :: * -> *) where
+class HasConstructor (f :: Type -> Type) where
   genericConstrName :: f x -> String
 
 instance HasConstructor f => HasConstructor (D1 c f) where
@@ -373,7 +378,7 @@ pDominators lim e = do
     liftIO $ hPutStrLn stderr $ "!!!!! Done multiBuildHeapGraph !!!!! in "<>(show $ (ns1-ns0))
 
     -- Validate that sizes in dominator tree seem right:
-    let !sizeTot = IM.foldl' (\s e-> s + hgeData e) 0 $ graph hg
+    let !sizeTot = IM.foldl' (\s e_-> s + hgeData e_) 0 $ graph hg
     liftIO $ hPutStrLn stderr $ "!!!!! Total size: "<> (show sizeTot)
 
   {-
@@ -457,7 +462,7 @@ topThunkClosures (Node n@((_, _, tp), _) forrest)
 -- ...or alternatively, prune children with retained size under some magnitude:
 -- assumes reverse sorted tree by retained
 pruneDownToPct :: Float -> Tree ((Int, y, ClosureType), InfoTablePtr) -> Tree ((Int, y, ClosureType), InfoTablePtr)
-pruneDownToPct p root@(Node x forrest) = Node x $ mapMaybe go forrest
+pruneDownToPct p _root@(Node x forrest) = Node x $ mapMaybe go forrest
   where limLower = case forrest of
           (Node ((rBiggest,_,_),_) _ : _) -> round (fromIntegral rBiggest * p)
           _ -> error "Blah"
@@ -472,7 +477,8 @@ defaultSnapshotLocation :: String
 defaultSnapshotLocation = "/tmp/ghc-debug-cache"
 
 -- Take snapshots in a loop forever, at intervals, overwriting.
-pSteppingSnapshot e = forM_ [0..] $ \i -> do
+pSteppingSnapshot :: Debuggee -> IO ()
+pSteppingSnapshot e = forM_ [(0::Int)..] $ \i -> do
   makeSnapshot e defaultSnapshotLocation
   putStrLn ("CACHED: " ++ show i)
   threadDelay 5_000_000
@@ -498,3 +504,135 @@ deriving instance MonadIO DebugM
 
 getSourceLoc :: DebugClosureWithSize pap string s b -> DebugM (Maybe SourceInformation) 
 getSourceLoc c = getSourceInfo (tableId (info (noSize c)))
+
+-- ================================================================================
+
+-- TODO consider consolidating not on iptr, but on (srcLoc, name, type) tuple
+
+-- Write out the heap graph to a file, in GML format
+-- ( https://web.archive.org/web/20190303094704/http://www.fim.uni-passau.de:80/fileadmin/files/lehrstuhl/brandenburg/projekte/gml/gml-technical-report.pdf )
+--
+--  - node per info-table, with accumulated size in bytes
+--    - source code loc attribute
+--    - type attribute (for node color)
+--  - edge means retains, with weights counting number of such relationships
+pWritePerInfoTableToGML :: FilePath -> Debuggee -> IO ()
+pWritePerInfoTableToGML path e = do
+  pause e
+  runTrace e $ do
+    _bs <- precacheBlocks
+    liftIO $ hPutStrLn stderr "!!!!! Done precacheBlocks !!!!!"
+    roots <- gcRoots
+    liftIO $ hPutStrLn stderr "!!!!! Done gcRoots !!!!!"
+
+    outHandle <- unsafeLiftIO $ openFile path WriteMode
+
+    when (dropWhile (/='.') path /= ".gml") $
+       error "Only .gml supported"
+
+    -- GML only supports Int32 Ids, so we need to remap iptr below
+    (nodes, edges, _) <- flip execStateT (mempty, mempty, 1::Int32) $ 
+           traceFromM emptyTraceFunctions{closTrace = closTraceFunc} roots
+
+    unsafeLiftIO $ do
+      hPutStrLn stderr "!!!!! Start writing to file !!!!!"
+      writeToFile nodes edges outHandle
+      hPutStrLn stderr $ "!!!!! Done writing "<>path<> " !!!!!"
+      hClose outHandle
+
+  where
+    writeToFile 
+      :: Map.Map InfoTablePtr ((Maybe SourceInformation, String, Bool, Int32), Size) 
+      -> Map.Map (InfoTablePtr, InfoTablePtr) Int
+      -> Handle
+      -> IO ()
+    writeToFile nodes edges outHandle = do
+      writeOpenGML
+
+      -- TODO DID I MESS UP THE ARROW DIRECTION
+      F.for_ nodes $ \((mbSI, closureTypeStr, isThunk, iptr32), size) -> 
+        case mbSI of
+          Nothing -> do
+            writeNode (iptr32, isThunk, size, closureTypeStr, Nothing)
+          Just SourceInformation{..} -> do
+            let typeStr = closureTypeStr<>" "<>infoType
+            writeNode (iptr32, isThunk, size, typeStr      , Just (infoLabel, infoPosition))
+
+      F.for_ (Map.toList edges) $ \((ptrFrom, ptrTo), cnt) -> do
+        Just ((_, _, fromIsThunk, iptrFrom32), _) <- pure $ Map.lookup ptrFrom nodes
+        Just ((_, _, _          , iptrTo32),   _) <- pure $ Map.lookup ptrTo   nodes
+        writeEdge (iptrFrom32, iptrTo32, cnt, fromIsThunk)
+
+      writeCloseGML
+      where
+        write = hPutStr outHandle
+        --
+        ---- GML File format:
+        writeOpenGML =
+          write $ "graph [\n"
+               <> "comment \"this is a graph in GML format\"\n"
+               <> "directed 1\n"
+        writeCloseGML =
+          write $ "]\n"
+
+        writeEdge (iptrFrom32, iptrTo32, cnt, fromIsThunk) = do
+          write $  "edge [\n"
+                <> "source "<> show iptrFrom32 <> "\n"
+                <> "target "<> show iptrTo32   <> "\n"
+                <> "count "<> show cnt         <> "\n"
+                <> (guard fromIsThunk >> 
+                   "fromIsThunk 1\n")
+                <> "]\n"
+
+
+        writeNode :: (Int32, Bool, Size, String, Maybe (String,String)) -> IO ()
+        writeNode (iptr32, isThunk, size, typeStr, mbMeta) = do
+          write $ "node [\n"
+                <> "id " <> show iptr32 <> "\n"
+                <> (guard isThunk >> 
+                   "isThunk 1\n")
+                <> "sizeBytes " <> show (getSize size) <> "\n"
+                -- string attributes; need to be quoted:
+                <> "type " <> show typeStr <> "\n"
+                <> (case mbMeta of 
+                      Nothing -> ""
+                      Just (infoLabel, infoPosition) ->
+                           "name "<> show infoLabel<> "\n"
+                        <> "pos " <> show infoPosition<> "\n"
+                   )
+                <> "]\n"
+
+
+    closTraceFunc _ptr (DCS size clos) continue = do
+      (nodes, edges, iptr32) <- get
+      let tid@(InfoTablePtr _iptr) = tableId $ info clos
+
+      (!nodes', !iptr32') <-
+        if Map.member tid nodes
+          -- Just accumulate the size from this new node:
+          then pure (Map.adjust (fmap (+size)) tid nodes  , iptr32)
+          -- Use iptr32 and increment for the next new node
+          else lift $ do
+            -- 'tipe' also ends up in SourceInformation, but not all info tables have that
+            let closureTypeStr = show $ tipe $ decodedTable $ info clos
+            let isThunk = "THUNK" `isPrefixOf` closureTypeStr
+            getSourceInfo tid >>= \case
+              -- TODO in what cases is source info not present?
+              Nothing -> 
+                pure (Map.insert tid ((Nothing, closureTypeStr, False, iptr32), size) nodes, iptr32+1)
+              Just si@SourceInformation{} -> do
+                -- When we record edges, we'll record some special metadata when from isThunk
+                pure (Map.insert tid ((Just si, closureTypeStr, isThunk, iptr32), size) nodes, iptr32+1)
+
+      -- Collect all outgoing edges from this closure...
+      !edges' <- lift $ flip execStateT edges $
+          -- TODO this is probably slow, since we need to resolve the InfoTablePtr again to make an edge
+          void $ flip (quadtraverse pure pure pure) clos $ \toPtr-> do
+            (DCS _ toClos) <- lift $ dereferenceClosure toPtr
+            let tidTarget = tableId $ info toClos
+            -- Increase edge count tid -> tidTo by one, else add new edge
+            modify $ Map.insertWith (+) (tid, tidTarget) 1
+
+      put (nodes', edges', iptr32')
+      
+      continue
