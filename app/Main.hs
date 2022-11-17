@@ -47,7 +47,7 @@ import System.IO
 import Data.Tree
 import Data.Maybe
 import Data.Either
-import Control.Arrow
+import Control.Arrow (first, (***))
 import qualified Data.Map as Map
 -- import Data.Ord
 import Data.List
@@ -59,10 +59,6 @@ import GHC.Clock
 
 import GHC.Int
 
-
--- TODO analyses:
---   - how many separate info_tables have identical SourceInformation ?
---      (can we elide these)
 
 -- Collect snapshot, stepping through so we have some control over memory usage:
 main :: IO ()
@@ -521,7 +517,7 @@ data ClusteringStrategy
 -- | Write out the heap graph to a file, in GML format
 -- ( https://web.archive.org/web/20190303094704/http://www.fim.uni-passau.de:80/fileadmin/files/lehrstuhl/brandenburg/projekte/gml/gml-technical-report.pdf )
 --
--- edge means "retains", with weights counting number of such relationships
+-- directed edge means "retains", with weights counting number of such relationships
 pClusteredHeapGML :: ClusteringStrategy -> FilePath -> Debuggee -> IO ()
 pClusteredHeapGML clusteringStrategy path e = do
   pause e
@@ -554,16 +550,17 @@ pClusteredHeapGML clusteringStrategy path e = do
       -> Handle
       -> IO ()
     writeToFile nodes edges outHandle = do
-      let (edgesToWrite, nodesToWrite) = case clusteringStrategy of
+      -- TODO factor this out; monadic just to control scope
+      (edgesToWrite, nodesToWrite) <- case clusteringStrategy of
             -- --------
-            ClusterByInfoTable ->
+            ClusterByInfoTable -> pure $
               -- just 'nodes' and 'edges', with no meaningful modifications:
               let nodesToWrite = map (\(x, size) -> (x, size, [])) $ Map.elems nodes -- []: no folded infoTable nodes
                   edgesToWrite = map (\((ptrFrom, ptrTo), cnt) -> (toPtr32 ptrFrom, toPtr32 ptrTo, cnt)) $ Map.toList edges 
                       where toPtr32 ptr = (\((_, _, _, iptr32), _)-> iptr32) $ fromJust $ Map.lookup ptr nodes
                in (edgesToWrite, nodesToWrite)
             -- --------
-            ClusterByTypeAndLocation ->
+            ClusterByTypeAndLocation -> pure $
               -- we'll write nodesNoInfo out unmodified, and fold identical nodesByInfo_dupes:
               let (nodesNoInfo, nodesByInfo_dupes) = partitionEithers $ map (uncurry hasSourceInfo) $ Map.toList nodes
                     where
@@ -579,8 +576,8 @@ pClusteredHeapGML clusteringStrategy path e = do
                   nodesByInfo = Map.fromListWith mergeNodes nodesByInfo_dupes
                     -- merge sizes in bytes, store source infotable ptrs so we can
                     -- remap edges and store as graph metadata the number of folded nodes:
-                    where mergeNodes ( (mbSI0, closureTypeStr0, isThunk0, iptr32_0), size0, iptrs0 )
-                                     ( (mbSI1, closureTypeStr1, isThunk1, iptr32_1), size1, iptrs1 ) =
+                    where mergeNodes ( ( mbSI0,  closureTypeStr0,  isThunk0, iptr32_0), size0, iptrs0 )
+                                     ( (_mbSI1, _closureTypeStr1, _isThunk1, iptr32_1), size1, iptrs1 ) =
                                          -- NOTE: keep the smallest iptr32, since that corresponds to first seen in traversal:
                                        ( (mbSI0, closureTypeStr0, isThunk0, min iptr32_0 iptr32_1), size0+size1 , iptrs1<>iptrs0 )
 
@@ -603,24 +600,19 @@ pClusteredHeapGML clusteringStrategy path e = do
                   edgesToWrite = map (\((ptrFrom, ptrTo), cnt) -> (ptrFrom, ptrTo, cnt)) $ Map.toList edgesRemapped
 
                in (edgesToWrite, nodesToWrite)
-                                  
 
       -- ------------------------ write gml file
       writeOpenGML
 
-      F.for_ nodes $ \((mbSI, closureTypeStr, isThunk, iptr32), size) -> 
-        case mbSI of
-          Nothing -> do
-            writeNode (iptr32, isThunk, size, closureTypeStr, Nothing)
-          Just SourceInformation{..} -> do
-            let typeStr = closureTypeStr<>" "<>infoType
-            writeNode (iptr32, isThunk, size, typeStr      , Just (infoLabel, infoPosition))
+      F.for_ nodesToWrite $ \((mbSI, closureTypeStr, isThunk, iptr32), size, iptrsFolded) -> 
+        writeNode (length iptrsFolded) iptr32 isThunk size $
+          case mbSI of
+            Nothing ->
+              (closureTypeStr, Nothing)
+            Just SourceInformation{..} ->
+              (closureTypeStr<>" "<>infoType, Just (infoLabel, infoPosition))
 
-      F.for_ (Map.toList edges) $ \((ptrFrom, ptrTo), cnt) -> do
-        Just ((_, _, _, iptrFrom32), _) <- pure $ Map.lookup ptrFrom nodes
-        Just ((_, _, __, iptrTo32),  _) <- pure $ Map.lookup ptrTo   nodes
-        writeEdge (iptrFrom32, iptrTo32, cnt)
-
+      F.for_ edgesToWrite writeEdge
       writeCloseGML
       where
         write = hPutStr outHandle
@@ -640,8 +632,13 @@ pClusteredHeapGML clusteringStrategy path e = do
                 <> "count "<> show cnt         <> "\n"
                 <> "]\n"
 
-        writeNode :: (Int32, Bool, Size, String, Maybe (String,String)) -> IO ()
-        writeNode (iptr32, isThunk, size, typeStr, mbMeta) = do
+        writeNode 
+            :: Int
+            -- ^ number of folded per-info-table clusters here;  these would
+            -- expand into n+1 nodes under ClusterByInfoTable
+            -> Int32 
+            -> Bool -> Size -> (String , Maybe (String,String)) -> IO ()
+        writeNode iptrsFoldedCnt iptr32 isThunk size (typeStr,mbMeta) = do
           -- The spec is vague, but graphia chokes on \" so strip:
           let renderQuoted = show . filter (== '"')
           write $ "node [\n"
@@ -649,6 +646,7 @@ pClusteredHeapGML clusteringStrategy path e = do
                 <> (guard isThunk >> 
                    "isThunk 1\n")
                 <> "sizeBytes " <> show (getSize size) <> "\n"
+                <> "infotablesFoldedCnt " <> show iptrsFoldedCnt <> "\n"
                 -- string attributes; need to be quoted:
                 <> "type " <> renderQuoted typeStr <> "\n"
                 <> (case mbMeta of 
