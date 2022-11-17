@@ -46,6 +46,8 @@ import System.Environment
 import System.IO
 import Data.Tree
 import Data.Maybe
+import Data.Either
+import Control.Arrow
 import qualified Data.Map as Map
 -- import Data.Ord
 import Data.List
@@ -78,8 +80,9 @@ main = do
                | otherwise = Just limI
        snapshotRun file $
          -- pRetainingThunks
-         pDominators lim
+         -- pDominators lim
          -- pFragmentation
+         pClusteredHeapGML ClusterByTypeAndLocation "/tmp/per-infoTable-byLoc.gml"
 
      ("--take-snapshot":mbSocket) -> do
        let sockPath = case mbSocket of
@@ -507,17 +510,20 @@ getSourceLoc c = getSourceInfo (tableId (info (noSize c)))
 
 -- ================================================================================
 
--- TODO consider consolidating not on iptr, but on (srcLoc, name, type) tuple
+-- TODO ...then a mode that consumes size of child without source info (add a bool flag)
+-- TODO ...and one that drops nodes until something matching predicate
 
--- Write out the heap graph to a file, in GML format
+data ClusteringStrategy 
+    = ClusterByInfoTable -- ^ node per info-table, with accumulated size in bytes
+    | ClusterByTypeAndLocation -- ^ above but go further, folding nodes with identical (but not missing) metadata
+    deriving (Show, Read, Eq)
+
+-- | Write out the heap graph to a file, in GML format
 -- ( https://web.archive.org/web/20190303094704/http://www.fim.uni-passau.de:80/fileadmin/files/lehrstuhl/brandenburg/projekte/gml/gml-technical-report.pdf )
 --
---  - node per info-table, with accumulated size in bytes
---    - source code loc attribute
---    - type attribute (for node color)
---  - edge means retains, with weights counting number of such relationships
-pWritePerInfoTableToGML :: FilePath -> Debuggee -> IO ()
-pWritePerInfoTableToGML path e = do
+-- edge means "retains", with weights counting number of such relationships
+pClusteredHeapGML :: ClusteringStrategy -> FilePath -> Debuggee -> IO ()
+pClusteredHeapGML clusteringStrategy path e = do
   pause e
   runTrace e $ do
     _bs <- precacheBlocks
@@ -532,7 +538,8 @@ pWritePerInfoTableToGML path e = do
 
     -- GML only supports Int32 Ids, so we need to remap iptr below
     (nodes, edges, _) <- flip execStateT (mempty, mempty, 1::Int32) $ 
-           traceFromM emptyTraceFunctions{closTrace = closTraceFunc} roots
+       -- 'traceFromM' visits every closure once, accounting for cycles
+       traceFromM emptyTraceFunctions{closTrace = closTraceFunc} roots
 
     unsafeLiftIO $ do
       hPutStrLn stderr "!!!!! Start writing to file !!!!!"
@@ -547,9 +554,44 @@ pWritePerInfoTableToGML path e = do
       -> Handle
       -> IO ()
     writeToFile nodes edges outHandle = do
+          -- we'll write nodesNoInfo out unmodified, and fold identical nodesByInfo_dupes:
+      let (nodesNoInfo, nodesByInfo_dupes) = partitionEithers $ map (uncurry hasSourceInfo) $ Map.toList nodes
+            where
+              hasSourceInfo iptr x@((mbSI, closureTypeStr, _, _), _) = case mbSI of
+                  Just SourceInformation{..} 
+                          -- We'll fold nodes with a key like e.g.: 
+                          -- ("main.balancedTree",,"example/Main.hs:25:67-69","CONSTR_2_0 Tree")
+                          -> Right ((infoLabel, infoPosition, closureTypeStr) , (x,[iptr]))
+                  Nothing -> Left x
+          
+          nodesByInfo :: Map.Map (String, String, String) 
+                                 (((Maybe SourceInformation, String, Bool, Int32), Size), [InfoTablePtr]) 
+          nodesByInfo = Map.fromListWith mergeNodes nodesByInfo_dupes
+            -- merge sizes in bytes, store source infotable ptrs so we can
+            -- remap edges and store as graph metadata the number of folded nodes:
+            where mergeNodes ( ((mbSI0, closureTypeStr0, isThunk0, iptr32_0), size0) , iptrs0 )
+                             ( ((mbSI1, closureTypeStr1, isThunk1, iptr32_1), size1) , iptrs1 ) =
+                                 -- NOTE: keep the smallest iptr32, since that corresponds to first seen in traversal:
+                               ( ((mbSI0, closureTypeStr0, isThunk0, min iptr32_0 iptr32_1), size0+size1) , iptrs1<>iptrs0 )
+
+          -- map edge src/dst ids to the new folded node ids, combine counts of any now-folded edges
+          edgesRemapped :: Map.Map (Int32, Int32) Int
+          edgesRemapped  = Map.fromListWith (+) $ map (first (remap *** remap)) $ Map.toList edges where
+            remap iptr = fromMaybe iptr32Orig $ Map.lookup iptr iptrRemapping where
+              -- this to/from node couldn't be folded (since no source info,
+              -- probably), so use the original node's int32 key
+              !iptr32Orig = case Map.lookup iptr nodes of
+                              Nothing -> error "Impossible! edgesRemapped"
+                              Just ((_, _, _, iptr32), _) -> iptr32
+
+            iptrRemapping :: Map.Map InfoTablePtr Int32
+            iptrRemapping = Map.fromList $ concatMap iptrsToIptrs32 $ Map.elems nodesByInfo where
+              iptrsToIptrs32 (((_, _, _, iptr32), _), iptrs) = map (,iptr32) iptrs
+                                  
+
+      -- ------------------------ write gml file
       writeOpenGML
 
-      -- TODO DID I MESS UP THE ARROW DIRECTION
       F.for_ nodes $ \((mbSI, closureTypeStr, isThunk, iptr32), size) -> 
         case mbSI of
           Nothing -> do
@@ -559,14 +601,14 @@ pWritePerInfoTableToGML path e = do
             writeNode (iptr32, isThunk, size, typeStr      , Just (infoLabel, infoPosition))
 
       F.for_ (Map.toList edges) $ \((ptrFrom, ptrTo), cnt) -> do
-        Just ((_, _, fromIsThunk, iptrFrom32), _) <- pure $ Map.lookup ptrFrom nodes
-        Just ((_, _, _          , iptrTo32),   _) <- pure $ Map.lookup ptrTo   nodes
-        writeEdge (iptrFrom32, iptrTo32, cnt, fromIsThunk)
+        Just ((_, _, _, iptrFrom32), _) <- pure $ Map.lookup ptrFrom nodes
+        Just ((_, _, __, iptrTo32),  _) <- pure $ Map.lookup ptrTo   nodes
+        writeEdge (iptrFrom32, iptrTo32, cnt)
 
       writeCloseGML
       where
         write = hPutStr outHandle
-        --
+
         ---- GML File format:
         writeOpenGML =
           write $ "graph [\n"
@@ -575,33 +617,31 @@ pWritePerInfoTableToGML path e = do
         writeCloseGML =
           write $ "]\n"
 
-        writeEdge (iptrFrom32, iptrTo32, cnt, fromIsThunk) = do
+        writeEdge (iptrFrom32, iptrTo32, cnt) = do
           write $  "edge [\n"
                 <> "source "<> show iptrFrom32 <> "\n"
                 <> "target "<> show iptrTo32   <> "\n"
                 <> "count "<> show cnt         <> "\n"
-                <> (guard fromIsThunk >> 
-                   "fromIsThunk 1\n")
                 <> "]\n"
-
 
         writeNode :: (Int32, Bool, Size, String, Maybe (String,String)) -> IO ()
         writeNode (iptr32, isThunk, size, typeStr, mbMeta) = do
+          -- The spec is vague, but graphia chokes on \" so strip:
+          let renderQuoted = show . filter (== '"')
           write $ "node [\n"
                 <> "id " <> show iptr32 <> "\n"
                 <> (guard isThunk >> 
                    "isThunk 1\n")
                 <> "sizeBytes " <> show (getSize size) <> "\n"
                 -- string attributes; need to be quoted:
-                <> "type " <> show typeStr <> "\n"
+                <> "type " <> renderQuoted typeStr <> "\n"
                 <> (case mbMeta of 
                       Nothing -> ""
                       Just (infoLabel, infoPosition) ->
-                           "name "<> show infoLabel<> "\n"
-                        <> "pos " <> show infoPosition<> "\n"
+                           "name "<> renderQuoted infoLabel<> "\n"
+                        <> "pos " <> renderQuoted infoPosition<> "\n"
                    )
                 <> "]\n"
-
 
     closTraceFunc _ptr (DCS size clos) continue = do
       (nodes, edges, iptr32) <- get
@@ -610,6 +650,7 @@ pWritePerInfoTableToGML path e = do
       (!nodes', !iptr32') <-
         if Map.member tid nodes
           -- Just accumulate the size from this new node:
+          -- TODO add counts
           then pure (Map.adjust (fmap (+size)) tid nodes  , iptr32)
           -- Use iptr32 and increment for the next new node
           else lift $ do
@@ -626,6 +667,8 @@ pWritePerInfoTableToGML path e = do
 
       -- Collect all outgoing edges from this closure...
       !edges' <- lift $ flip execStateT edges $
+          -- Here we go one hop further to build (possibly to an already-visited 
+          -- node which we wouldn't be able to reach via traceFromM)
           -- TODO this is probably slow, since we need to resolve the InfoTablePtr again to make an edge
           void $ flip (quadtraverse pure pure pure) clos $ \toPtr-> do
             (DCS _ toClos) <- lift $ dereferenceClosure toPtr
