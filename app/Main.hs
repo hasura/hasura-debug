@@ -566,10 +566,12 @@ pClusteredHeapGML clusteringStrategy path e = do
                     where
                       hasSourceInfo iptr (xMeta@(mbSI, _, _, _), size) = case mbSI of
                           Just SourceInformation{..} 
-                                  -- We'll fold nodes with a key like e.g.: 
-                                  -- ("main.balancedTree","example/Main.hs:25:67-69","Tree")
-                                  -> Right ((infoLabel, infoPosition, infoType) , (xMeta, size, [iptr]))
-                          Nothing -> Left (xMeta, size, []) -- []: no folded infoTable nodes
+                            -- We'll fold nodes with a key like e.g.: 
+                            -- ("main.balancedTree","example/Main.hs:25:67-69","Tree")
+                            -- ...so long as we have defined code location
+                            | all (not . null) [infoLabel, infoPosition]
+                                -> Right ((infoLabel, infoPosition, infoType) , (xMeta, size, [iptr]))
+                          _     -> Left (xMeta, size, []) -- []: no folded infoTable nodes
                   
                   nodesByInfo :: Map.Map (String, String, String) 
                                          ((Maybe SourceInformation, String, Bool, Int32), Size, [InfoTablePtr]) 
@@ -640,7 +642,7 @@ pClusteredHeapGML clusteringStrategy path e = do
             -> Bool -> Size -> (String , Maybe (String,String)) -> IO ()
         writeNode iptrsFoldedCnt iptr32 isThunk size (typeStr,mbMeta) = do
           -- The spec is vague, but graphia chokes on \" so strip:
-          let renderQuoted = show . filter (== '"')
+          let renderQuoted = show . filter (/= '"')
           write $ "node [\n"
                 <> "id " <> show iptr32 <> "\n"
                 <> (guard isThunk >> 
