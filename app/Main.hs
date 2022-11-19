@@ -78,7 +78,7 @@ main = do
          -- pRetainingThunks
          -- pDominators lim
          -- pFragmentation
-         pClusteredHeapGML ClusterByTypeAndLocation "/tmp/per-infoTable-byLoc.gml"
+         pClusteredHeapGML (ClusterBySourceInfo True) "/tmp/per-infoTable-byLoc.gml"
 
      ("--take-snapshot":mbSocket) -> do
        let sockPath = case mbSocket of
@@ -507,11 +507,18 @@ getSourceLoc c = getSourceInfo (tableId (info (noSize c)))
 -- ================================================================================
 
 -- TODO ...then a mode that consumes size of child without source info (add a bool flag)
--- TODO ...and one that drops nodes until something matching predicate
+-- TODO dominator tree with accumulating sizes...
+--    TODO incorporate fgl (for above), 
+--         add a simple repl for doing queries, displaying data
+-- TODO print stats, e.g. objects by module
 
 data ClusteringStrategy 
     = ClusterByInfoTable -- ^ node per info-table, with accumulated size in bytes
-    | ClusterByTypeAndLocation -- ^ above but go further, folding nodes with identical (but not missing) metadata
+    | ClusterBySourceInfo Bool 
+    -- ^ above but go further, folding nodes with identical (but not missing)
+    -- metadata. 'True' here indicates whether to go further and cluster on
+    -- source location spans, ignoring type information (type will be labeled
+    -- "VARIOUS")
     deriving (Show, Read, Eq)
 
 -- | Write out the heap graph to a file, in GML format
@@ -560,20 +567,24 @@ pClusteredHeapGML clusteringStrategy path e = do
                       where toPtr32 ptr = (\((_, _, _, iptr32), _)-> iptr32) $ fromJust $ Map.lookup ptr nodes
                in (edgesToWrite, nodesToWrite)
             -- --------
-            ClusterByTypeAndLocation -> pure $
+            ClusterBySourceInfo justBySourceLoc -> pure $
               -- we'll write nodesNoInfo out unmodified, and fold identical nodesByInfo_dupes:
               let (nodesNoInfo, nodesByInfo_dupes) = partitionEithers $ map (uncurry hasSourceInfo) $ Map.toList nodes
                     where
-                      hasSourceInfo iptr (xMeta@(mbSI, _, _, _), size) = case mbSI of
-                          Just SourceInformation{..} 
+                      hasSourceInfo iptr (xMeta@(mbSI, x, y, z), size) = case mbSI of
+                          Just si@SourceInformation{..} 
                             -- We'll fold nodes with a key like e.g.: 
                             -- ("main.balancedTree","example/Main.hs:25:67-69","Tree")
                             -- ...so long as we have defined code location
                             | all (not . null) [infoLabel, infoPosition]
-                                -> Right ((infoLabel, infoPosition, infoType) , (xMeta, size, [iptr]))
+                                -> Right $ if justBySourceLoc
+                                              then (infoPosition                          
+                                                   , ((Just si{infoLabel="VARIOUS", infoType="VARIOUS"},x,y,z), size, [iptr]))
+                                              else (infoLabel <> infoPosition <> infoType 
+                                                   , (xMeta, size, [iptr]))
                           _     -> Left (xMeta, size, []) -- []: no folded infoTable nodes
                   
-                  nodesByInfo :: Map.Map (String, String, String) 
+                  nodesByInfo :: Map.Map String -- either (infoLabel <> infoPosition <> infoType) or just infoPosition, if justBySourceLoc
                                          ((Maybe SourceInformation, String, Bool, Int32), Size, [InfoTablePtr]) 
                   nodesByInfo = Map.fromListWith mergeNodes nodesByInfo_dupes
                     -- merge sizes in bytes, store source infotable ptrs so we can
