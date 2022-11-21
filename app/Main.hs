@@ -547,22 +547,21 @@ pClusteredHeapGML clusteringStrategy path e = do
        -- 'traceFromM' visits every closure once, accounting for cycles
        traceFromM emptyTraceFunctions{closTrace = closTraceFunc} roots
 
+    let (edgesToWrite, nodesToWrite) = buildClusteredGraph nodes edges clusteringStrategy
+
     unsafeLiftIO $ do
       hPutStrLn stderr "!!!!! Start writing to file !!!!!"
-      writeToFile nodes edges outHandle
+      writeToFile nodesToWrite edgesToWrite outHandle
       hPutStrLn stderr $ "!!!!! Done writing "<>path<> " !!!!!"
       hClose outHandle
 
   where
-    writeToFile 
-      :: Map.Map InfoTablePtr ((Maybe SourceInformation, String, Bool, Int32), Size) 
-      -> Map.Map (InfoTablePtr, InfoTablePtr) Int
-      -> Handle
+    writeToFile
+      :: [((Maybe SourceInformation, String, Bool, Int32), Size, [a])]
+      -> [(Int32, Int32, Int)] 
+      -> Handle 
       -> IO ()
-    writeToFile nodes edges outHandle = do
-      let (edgesToWrite, nodesToWrite) = buildClusteredGraph nodes edges clusteringStrategy
-
-      -- ------------------------ write gml file
+    writeToFile nodesToWrite edgesToWrite outHandle = do
       writeOpenGML
 
       F.for_ nodesToWrite $ \((mbSI, closureTypeStr, isThunk, iptr32), size, iptrsFolded) -> 
