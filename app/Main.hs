@@ -59,6 +59,9 @@ import GHC.Clock
 
 import GHC.Int
 
+import qualified Data.Graph.Inductive.Graph as FGL
+import qualified Data.Graph.Inductive.PatriciaTree as FGL
+
 
 -- Collect snapshot, stepping through so we have some control over memory usage:
 main :: IO ()
@@ -557,62 +560,7 @@ pClusteredHeapGML clusteringStrategy path e = do
       -> Handle
       -> IO ()
     writeToFile nodes edges outHandle = do
-      -- TODO factor this out; monadic just to control scope
-      (edgesToWrite, nodesToWrite) <- case clusteringStrategy of
-            -- --------
-            ClusterByInfoTable -> pure $
-              -- just 'nodes' and 'edges', with no meaningful modifications:
-              let nodesToWrite = map (\(x, size) -> (x, size, [])) $ Map.elems nodes -- []: no folded infoTable nodes
-                  edgesToWrite = map (\((ptrFrom, ptrTo), cnt) -> (toPtr32 ptrFrom, toPtr32 ptrTo, cnt)) $ Map.toList edges 
-                      where toPtr32 ptr = (\((_, _, _, iptr32), _)-> iptr32) $ fromJust $ Map.lookup ptr nodes
-               in (edgesToWrite, nodesToWrite)
-            -- --------
-            ClusterBySourceInfo justBySourceLoc -> pure $
-              -- we'll write nodesNoInfo out unmodified, and fold identical nodesByInfo_dupes:
-              let (nodesNoInfo, nodesByInfo_dupes) = partitionEithers $ map (uncurry hasSourceInfo) $ Map.toList nodes
-                    where
-                      hasSourceInfo iptr (xMeta@(mbSI, x, y, z), size) = case mbSI of
-                          Just si@SourceInformation{..} 
-                            -- We'll fold nodes with a key like e.g.: 
-                            -- ("main.balancedTree","example/Main.hs:25:67-69","Tree")
-                            -- ...so long as we have defined code location
-                            | all (not . null) [infoLabel, infoPosition]
-                                -> Right $ if justBySourceLoc
-                                              then (infoPosition                          
-                                                   , ((Just si{infoLabel="VARIOUS", infoType="VARIOUS"},x,y,z), size, [iptr]))
-                                              else (infoLabel <> infoPosition <> infoType 
-                                                   , (xMeta, size, [iptr]))
-                          _     -> Left (xMeta, size, []) -- []: no folded infoTable nodes
-                  
-                  nodesByInfo :: Map.Map String -- either (infoLabel <> infoPosition <> infoType) or just infoPosition, if justBySourceLoc
-                                         ((Maybe SourceInformation, String, Bool, Int32), Size, [InfoTablePtr]) 
-                  nodesByInfo = Map.fromListWith mergeNodes nodesByInfo_dupes
-                    -- merge sizes in bytes, store source infotable ptrs so we can
-                    -- remap edges and store as graph metadata the number of folded nodes:
-                    where mergeNodes ( ( mbSI0,  closureTypeStr0,  isThunk0, iptr32_0), size0, iptrs0 )
-                                     ( (_mbSI1, _closureTypeStr1, _isThunk1, iptr32_1), size1, iptrs1 ) =
-                                         -- NOTE: keep the smallest iptr32, since that corresponds to first seen in traversal:
-                                       ( (mbSI0, closureTypeStr0, isThunk0, min iptr32_0 iptr32_1), size0+size1 , iptrs1<>iptrs0 )
-
-                  -- map edge src/dst ids to the new folded node ids, combine counts of any now-folded edges
-                  edgesRemapped :: Map.Map (Int32, Int32) Int
-                  edgesRemapped  = Map.fromListWith (+) $ map (first (remap *** remap)) $ Map.toList edges where
-                    remap iptr = fromMaybe iptr32Orig $ Map.lookup iptr iptrRemapping where
-                      -- this to/from node couldn't be folded (since no source info,
-                      -- probably), so use the original node's int32 key
-                      !iptr32Orig = case Map.lookup iptr nodes of
-                                      Nothing -> error "Impossible! edgesRemapped"
-                                      Just ((_, _, _, iptr32), _) -> iptr32
-
-                    iptrRemapping :: Map.Map InfoTablePtr Int32
-                    iptrRemapping = Map.fromList $ concatMap iptrsToIptrs32 $ Map.elems nodesByInfo where
-                      iptrsToIptrs32 ((_, _, _, iptr32), _, iptrs) = map (,iptr32) iptrs
-
-                  -- output:
-                  nodesToWrite = Map.elems nodesByInfo <> nodesNoInfo
-                  edgesToWrite = map (\((ptrFrom, ptrTo), cnt) -> (ptrFrom, ptrTo, cnt)) $ Map.toList edgesRemapped
-
-               in (edgesToWrite, nodesToWrite)
+      let (edgesToWrite, nodesToWrite) = buildClusteredGraph nodes edges clusteringStrategy
 
       -- ------------------------ write gml file
       writeOpenGML
@@ -706,3 +654,65 @@ pClusteredHeapGML clusteringStrategy path e = do
       put (nodes', edges', iptr32')
       
       continue
+
+buildClusteredGraph 
+  :: Map.Map InfoTablePtr ((Maybe SourceInformation, String, Bool, Int32), Size)
+  -> Map.Map (InfoTablePtr, InfoTablePtr) Int
+  -> ClusteringStrategy
+  -> ([(Int32, Int32, Int)],
+      [((Maybe SourceInformation, String, Bool, Int32), Size, [InfoTablePtr])])
+buildClusteredGraph nodes edges = \case
+  -- --------
+  ClusterByInfoTable ->
+    -- just 'nodes' and 'edges', with no meaningful modifications:
+    let nodesToWrite = map (\(x, size) -> (x, size, [])) $ Map.elems nodes -- []: no folded infoTable nodes
+        edgesToWrite = map (\((ptrFrom, ptrTo), cnt) -> (toPtr32 ptrFrom, toPtr32 ptrTo, cnt)) $ Map.toList edges 
+            where toPtr32 ptr = (\((_, _, _, iptr32), _)-> iptr32) $ fromJust $ Map.lookup ptr nodes
+     in (edgesToWrite, nodesToWrite)
+  -- --------
+  ClusterBySourceInfo justBySourceLoc ->
+    -- we'll write nodesNoInfo out unmodified, and fold identical nodesByInfo_dupes:
+    let (nodesNoInfo, nodesByInfo_dupes) = partitionEithers $ map (uncurry hasSourceInfo) $ Map.toList nodes
+          where
+            hasSourceInfo iptr (xMeta@(mbSI, x, y, z), size) = case mbSI of
+                Just si@SourceInformation{..} 
+                  -- We'll fold nodes with a key like e.g.: 
+                  -- ("main.balancedTree","example/Main.hs:25:67-69","Tree")
+                  -- ...so long as we have defined code location
+                  | all (not . null) [infoLabel, infoPosition]
+                      -> Right $ if justBySourceLoc
+                                    then (infoPosition                          
+                                         , ((Just si{infoLabel="VARIOUS", infoType="VARIOUS"},x,y,z), size, [iptr]))
+                                    else (infoLabel <> infoPosition <> infoType 
+                                         , (xMeta, size, [iptr]))
+                _     -> Left (xMeta, size, []) -- []: no folded infoTable nodes
+        
+        nodesByInfo :: Map.Map String -- either (infoLabel <> infoPosition <> infoType) or just infoPosition, if justBySourceLoc
+                               ((Maybe SourceInformation, String, Bool, Int32), Size, [InfoTablePtr]) 
+        nodesByInfo = Map.fromListWith mergeNodes nodesByInfo_dupes
+          -- merge sizes in bytes, store source infotable ptrs so we can
+          -- remap edges and store as graph metadata the number of folded nodes:
+          where mergeNodes ( ( mbSI0,  closureTypeStr0,  isThunk0, iptr32_0), size0, iptrs0 )
+                           ( (_mbSI1, _closureTypeStr1, _isThunk1, iptr32_1), size1, iptrs1 ) =
+                               -- NOTE: keep the smallest iptr32, since that corresponds to first seen in traversal:
+                             ( (mbSI0, closureTypeStr0, isThunk0, min iptr32_0 iptr32_1), size0+size1 , iptrs1<>iptrs0 )
+
+        -- map edge src/dst ids to the new folded node ids, combine counts of any now-folded edges
+        edgesRemapped :: Map.Map (Int32, Int32) Int
+        edgesRemapped  = Map.fromListWith (+) $ map (first (remap *** remap)) $ Map.toList edges where
+          remap iptr = fromMaybe iptr32Orig $ Map.lookup iptr iptrRemapping where
+            -- this to/from node couldn't be folded (since no source info,
+            -- probably), so use the original node's int32 key
+            !iptr32Orig = case Map.lookup iptr nodes of
+                            Nothing -> error "Impossible! edgesRemapped"
+                            Just ((_, _, _, iptr32), _) -> iptr32
+
+          iptrRemapping :: Map.Map InfoTablePtr Int32
+          iptrRemapping = Map.fromList $ concatMap iptrsToIptrs32 $ Map.elems nodesByInfo where
+            iptrsToIptrs32 ((_, _, _, iptr32), _, iptrs) = map (,iptr32) iptrs
+
+        -- output:
+        nodesToWrite = Map.elems nodesByInfo <> nodesNoInfo
+        edgesToWrite = map (\((ptrFrom, ptrTo), cnt) -> (ptrFrom, ptrTo, cnt)) $ Map.toList edgesRemapped
+
+     in (edgesToWrite, nodesToWrite)
