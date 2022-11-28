@@ -40,6 +40,7 @@ import qualified Data.IntMap as IM
 -- import Control.Applicative
 -- import Data.Traversable
 import Data.Kind
+import Data.Tuple
 
 -- import System.Process
 import System.Environment
@@ -47,7 +48,7 @@ import System.IO
 import Data.Tree
 import Data.Maybe
 import Data.Either
-import Control.Arrow (first, (***))
+import Control.Arrow (first, (***), (&&&))
 import qualified Data.Map as Map
 -- import Data.Ord
 import Data.List
@@ -61,6 +62,7 @@ import GHC.Int
 
 import qualified Data.Graph.Inductive.Graph as FGL
 import qualified Data.Graph.Inductive.PatriciaTree as FGL
+import qualified Data.Graph.Inductive.Query.Dominators as FGL
 
 
 -- Collect snapshot, stepping through so we have some control over memory usage:
@@ -358,7 +360,7 @@ instance Constructor c => HasConstructor (C1 c f) where
   genericConstrName x = conName x
 -- --------------------------------------------------
 
-
+-- See also pClusteredHeapGML which annotates dominator size, clustered by infotable/source loc
 pDominators 
   :: Maybe Int 
   -- ^ How deep should we recurse?
@@ -510,24 +512,24 @@ getSourceLoc c = getSourceInfo (tableId (info (noSize c)))
 -- ================================================================================
 
 -- TODO ...then a mode that consumes size of child without source info (add a bool flag)
--- TODO dominator tree with accumulating sizes...
---    TODO incorporate fgl (for above), 
---         add a simple repl for doing queries, displaying data
+-- TODO add a simple repl for doing queries, displaying data
 -- TODO print stats, e.g. objects by module
 
 data ClusteringStrategy 
     = ClusterByInfoTable -- ^ node per info-table, with accumulated size in bytes
     | ClusterBySourceInfo Bool 
     -- ^ above but go further, folding nodes with identical (but not missing)
-    -- metadata. 'True' here indicates whether to go further and cluster on
+    -- metadata. 'True' here indicates whether to go even further and cluster on
     -- source location spans, ignoring type information (type will be labeled
     -- "VARIOUS")
     deriving (Show, Read, Eq)
 
--- | Write out the heap graph to a file, in GML format
--- ( https://web.archive.org/web/20190303094704/http://www.fim.uni-passau.de:80/fileadmin/files/lehrstuhl/brandenburg/projekte/gml/gml-technical-report.pdf )
+-- | Write out the heap graph, with heap objects clustered by info table, to a
+-- file, in GML format:
 --
--- directed edge means "retains", with weights counting number of such relationships
+--    https://web.archive.org/web/20190303094704/http://www.fim.uni-passau.de:80/fileadmin/files/lehrstuhl/brandenburg/projekte/gml/gml-technical-report.pdf 
+--
+-- Directed edge means "retains", with weights counting number of such relationships
 pClusteredHeapGML :: ClusteringStrategy -> FilePath -> Debuggee -> IO ()
 pClusteredHeapGML clusteringStrategy path e = do
   pause e
@@ -543,9 +545,13 @@ pClusteredHeapGML clusteringStrategy path e = do
        error "Only .gml supported"
 
     -- GML only supports Int32 Ids, so we need to remap iptr below
-    (nodes, edges, _) <- flip execStateT (mempty, mempty, 1::Int32) $ 
+    -- NOTE: addDominatedSize assumes 1 is the root node
+    (nodes0, edges, _) <- flip execStateT (mempty, mempty, 1::Int32) $ 
        -- 'traceFromM' visits every closure once, accounting for cycles
        traceFromM emptyTraceFunctions{closTrace = closTraceFunc} roots
+
+    -- add transitive dominated size to nodes:
+    let nodes = addDominatedSize nodes0 edges
 
     let (edgesToWrite, nodesToWrite) = buildClusteredGraph nodes edges clusteringStrategy
 
@@ -557,15 +563,15 @@ pClusteredHeapGML clusteringStrategy path e = do
 
   where
     writeToFile
-      :: [((Maybe SourceInformation, String, Bool, Int32), Size, [a])]
+      :: [((Maybe SourceInformation, String, Bool, Int32), Size, Size, [a])]
       -> [(Int32, Int32, Int)] 
       -> Handle 
       -> IO ()
     writeToFile nodesToWrite edgesToWrite outHandle = do
       writeOpenGML
 
-      F.for_ nodesToWrite $ \((mbSI, closureTypeStr, isThunk, iptr32), size, iptrsFolded) -> 
-        writeNode (length iptrsFolded) iptr32 isThunk size $
+      F.for_ nodesToWrite $ \((mbSI, closureTypeStr, isThunk, iptr32), size, sizeDominated, iptrsFolded) -> 
+        writeNode (length iptrsFolded) iptr32 isThunk size sizeDominated $
           case mbSI of
             Nothing ->
               (closureTypeStr, Nothing)
@@ -597,8 +603,8 @@ pClusteredHeapGML clusteringStrategy path e = do
             -- ^ number of folded per-info-table clusters here;  these would
             -- expand into n+1 nodes under ClusterByInfoTable
             -> Int32 
-            -> Bool -> Size -> (String , Maybe (String,String)) -> IO ()
-        writeNode iptrsFoldedCnt iptr32 isThunk size (typeStr,mbMeta) = do
+            -> Bool -> Size -> Size -> (String , Maybe (String,String)) -> IO ()
+        writeNode iptrsFoldedCnt iptr32 isThunk size sizeDominated (typeStr,mbMeta) = do
           -- The spec is vague, but graphia chokes on \" so strip:
           let renderQuoted = show . filter (/= '"')
           write $ "node [\n"
@@ -606,6 +612,7 @@ pClusteredHeapGML clusteringStrategy path e = do
                 <> (guard isThunk >> 
                    "isThunk 1\n")
                 <> "sizeBytes " <> show (getSize size) <> "\n"
+                <> "sizeTransitiveDominated " <> show (getSize sizeDominated) <> "\n"
                 <> "infotablesFoldedCnt " <> show iptrsFoldedCnt <> "\n"
                 -- string attributes; need to be quoted:
                 <> "type " <> renderQuoted typeStr <> "\n"
@@ -655,25 +662,25 @@ pClusteredHeapGML clusteringStrategy path e = do
       continue
 
 buildClusteredGraph 
-  :: Map.Map InfoTablePtr ((Maybe SourceInformation, String, Bool, Int32), Size)
+  :: Map.Map InfoTablePtr ((Maybe SourceInformation, String, Bool, Int32), Size, Size)
   -> Map.Map (InfoTablePtr, InfoTablePtr) Int
   -> ClusteringStrategy
   -> ([(Int32, Int32, Int)],
-      [((Maybe SourceInformation, String, Bool, Int32), Size, [InfoTablePtr])])
+      [((Maybe SourceInformation, String, Bool, Int32), Size, Size, [InfoTablePtr])])
 buildClusteredGraph nodes edges = \case
   -- --------
   ClusterByInfoTable ->
     -- just 'nodes' and 'edges', with no meaningful modifications:
-    let nodesToWrite = map (\(x, size) -> (x, size, [])) $ Map.elems nodes -- []: no folded infoTable nodes
+    let nodesToWrite = map (\(x, size, sizeDominated) -> (x, size, sizeDominated, [])) $ Map.elems nodes -- []: no folded infoTable nodes
         edgesToWrite = map (\((ptrFrom, ptrTo), cnt) -> (toPtr32 ptrFrom, toPtr32 ptrTo, cnt)) $ Map.toList edges 
-            where toPtr32 ptr = (\((_, _, _, iptr32), _)-> iptr32) $ fromJust $ Map.lookup ptr nodes
+            where toPtr32 ptr = (\((_, _, _, iptr32), _, _)-> iptr32) $ fromJust $ Map.lookup ptr nodes
      in (edgesToWrite, nodesToWrite)
   -- --------
   ClusterBySourceInfo justBySourceLoc ->
     -- we'll write nodesNoInfo out unmodified, and fold identical nodesByInfo_dupes:
     let (nodesNoInfo, nodesByInfo_dupes) = partitionEithers $ map (uncurry hasSourceInfo) $ Map.toList nodes
           where
-            hasSourceInfo iptr (xMeta@(mbSI, x, y, z), size) = case mbSI of
+            hasSourceInfo iptr (xMeta@(mbSI, x, y, z), size, sizeDominated) = case mbSI of
                 Just si@SourceInformation{..} 
                   -- We'll fold nodes with a key like e.g.: 
                   -- ("main.balancedTree","example/Main.hs:25:67-69","Tree")
@@ -681,20 +688,22 @@ buildClusteredGraph nodes edges = \case
                   | all (not . null) [infoLabel, infoPosition]
                       -> Right $ if justBySourceLoc
                                     then (infoPosition                          
-                                         , ((Just si{infoLabel="VARIOUS", infoType="VARIOUS"},x,y,z), size, [iptr]))
+                                         , ((Just si{infoLabel="VARIOUS", infoType="VARIOUS"},x,y,z), size, sizeDominated, [iptr]))
                                     else (infoLabel <> infoPosition <> infoType 
-                                         , (xMeta, size, [iptr]))
-                _     -> Left (xMeta, size, []) -- []: no folded infoTable nodes
+                                         , (xMeta, size, sizeDominated, [iptr]))
+                _     -> Left (xMeta, size, sizeDominated, []) -- []: no folded infoTable nodes
         
         nodesByInfo :: Map.Map String -- either (infoLabel <> infoPosition <> infoType) or just infoPosition, if justBySourceLoc
-                               ((Maybe SourceInformation, String, Bool, Int32), Size, [InfoTablePtr]) 
+                               ((Maybe SourceInformation, String, Bool, Int32), Size, Size, [InfoTablePtr]) 
         nodesByInfo = Map.fromListWith mergeNodes nodesByInfo_dupes
           -- merge sizes in bytes, store source infotable ptrs so we can
           -- remap edges and store as graph metadata the number of folded nodes:
-          where mergeNodes ( ( mbSI0,  closureTypeStr0,  isThunk0, iptr32_0), size0, iptrs0 )
-                           ( (_mbSI1, _closureTypeStr1, _isThunk1, iptr32_1), size1, iptrs1 ) =
+          where mergeNodes ( ( mbSI0,  closureTypeStr0,  isThunk0, iptr32_0), size0, sizeDominated0, iptrs0 )
+                           ( (_mbSI1, _closureTypeStr1, _isThunk1, iptr32_1), size1, sizeDominated1, iptrs1 ) =
                                -- NOTE: keep the smallest iptr32, since that corresponds to first seen in traversal:
-                             ( (mbSI0, closureTypeStr0, isThunk0, min iptr32_0 iptr32_1), size0+size1 , iptrs1<>iptrs0 )
+                             ( (mbSI0, closureTypeStr0, isThunk0, min iptr32_0 iptr32_1) 
+                                 -- merge sizes:
+                                 , size0+size1 , sizeDominated0+sizeDominated1, iptrs1<>iptrs0 )
 
         -- map edge src/dst ids to the new folded node ids, combine counts of any now-folded edges
         edgesRemapped :: Map.Map (Int32, Int32) Int
@@ -704,14 +713,71 @@ buildClusteredGraph nodes edges = \case
             -- probably), so use the original node's int32 key
             !iptr32Orig = case Map.lookup iptr nodes of
                             Nothing -> error "Impossible! edgesRemapped"
-                            Just ((_, _, _, iptr32), _) -> iptr32
+                            Just ((_, _, _, iptr32), _, _) -> iptr32
 
           iptrRemapping :: Map.Map InfoTablePtr Int32
           iptrRemapping = Map.fromList $ concatMap iptrsToIptrs32 $ Map.elems nodesByInfo where
-            iptrsToIptrs32 ((_, _, _, iptr32), _, iptrs) = map (,iptr32) iptrs
+            iptrsToIptrs32 ((_, _, _, iptr32), _, _, iptrs) = map (,iptr32) iptrs
 
         -- output:
         nodesToWrite = Map.elems nodesByInfo <> nodesNoInfo
         edgesToWrite = map (\((ptrFrom, ptrTo), cnt) -> (ptrFrom, ptrTo, cnt)) $ Map.toList edgesRemapped
 
      in (edgesToWrite, nodesToWrite)
+
+-- Generate a dominator tree from the graph, annotating each node with the
+-- transitive size of the graph it dominates; i.e. the total size in bytes of
+-- all its descendents.
+addDominatedSize :: (Ord k) => 
+    Map.Map k ((a, b, c, Int32), Size) -> 
+    Map.Map (k, k) x ->
+    Map.Map k ((a, b, c, Int32), Size, Size)
+addDominatedSize nodes0 edges =
+      -- NOTE: iDom returns reverse order from dominator tree edges:
+  let dominatedByEdges = FGL.iDom g 1
+
+      -- lazily accumulate transitive dominator sub-tree sizes
+      -- leaves will be missing, but their sizes accounted for
+      transSizes = 
+          let domNodesChilds :: Map.Map Int [Int] 
+              domNodesChilds = Map.fromListWith (<>) $ map (fmap pure . swap) dominatedByEdges
+           in Map.mapWithKey accum domNodesChilds
+          where accum parent children = sizeOf parent + (sum $ map transSizeOf children)
+
+      transSizeOf nodeId = 
+        fromMaybe (sizeOf nodeId) $ -- ...if it's a leaf of dominator tree
+          Map.lookup nodeId transSizes
+
+      annotate xsz@(x, sz) = (x, sz, transSizeOf $ getNodeId xsz)
+
+   in fmap annotate nodes0
+   where
+      getKey i = getNodeId $ fromJust $ Map.lookup i nodes0
+      getNodeId ((_, _, _, iptr32), _) = fromIntegral iptr32
+
+      g :: FGL.Gr Size ()
+      g = FGL.mkGraph fglNodes fglEdges
+      fglNodes = map (getNodeId &&& snd) $ Map.elems nodes0
+      fglEdges = map ( \(fromI,toI)-> (getKey fromI, getKey toI, ()) ) $ Map.keys edges
+
+      sizeOf = fromJust . FGL.lab g
+
+test_addDominatedSize :: Bool
+test_addDominatedSize = 
+    -- From https://en.wikipedia.org/wiki/Dominator_(graph_theory)
+    let edges = Map.fromList $ map ((,())) [(1::Int,2::Int), (2, 3), (2, 4), (2, 6), (3, 5), (4, 5), (5, 2)]
+        -- make the size equal to node id
+        nodes = Map.fromList $ map (\n-> (n,  (((),(),(),fromIntegral n), fromIntegral n)  )) [1..6]
+
+        expected =
+            Map.fromList [
+                (1,(((),(),(),1),Size {getSize = 1},Size {getSize = 21})),
+                -- own size (2) + 3+4+5+6 = 20:
+                (2,(((),(),(),2),Size {getSize = 2},Size {getSize = 20})),
+                -- leaves just accum their own size:
+                (3,(((),(),(),3),Size {getSize = 3},Size {getSize = 3})),
+                (4,(((),(),(),4),Size {getSize = 4},Size {getSize = 4})),
+                (5,(((),(),(),5),Size {getSize = 5},Size {getSize = 5})),
+                (6,(((),(),(),6),Size {getSize = 6},Size {getSize = 6}))]
+
+     in expected == addDominatedSize nodes edges

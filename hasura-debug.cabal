@@ -33,6 +33,7 @@ executable hasura-debug
                       ghc-debug-client,
                       ghc-debug-common,
                       mtl,
+                      fgl,
                       containers,
                       process,
                       async,
