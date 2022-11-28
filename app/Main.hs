@@ -83,7 +83,7 @@ main = do
          -- pRetainingThunks
          -- pDominators lim
          -- pFragmentation
-         pClusteredHeapGML (ClusterBySourceInfo True) "/tmp/per-infoTable-byLoc.gml"
+         pClusteredHeapGML (ClusterBySourceInfo False) "/tmp/per-infoTable-byLoc"
 
      ("--take-snapshot":mbSocket) -> do
        let sockPath = case mbSocket of
@@ -531,18 +531,13 @@ data ClusteringStrategy
 --
 -- Directed edge means "retains", with weights counting number of such relationships
 pClusteredHeapGML :: ClusteringStrategy -> FilePath -> Debuggee -> IO ()
-pClusteredHeapGML clusteringStrategy path e = do
+pClusteredHeapGML clusteringStrategy pathNoExtension e = do
   pause e
   runTrace e $ do
     _bs <- precacheBlocks
     liftIO $ hPutStrLn stderr "!!!!! Done precacheBlocks !!!!!"
     roots <- gcRoots
     liftIO $ hPutStrLn stderr "!!!!! Done gcRoots !!!!!"
-
-    outHandle <- unsafeLiftIO $ openFile path WriteMode
-
-    when (dropWhile (/='.') path /= ".gml") $
-       error "Only .gml supported"
 
     -- GML only supports Int32 Ids, so we need to remap iptr below
     -- NOTE: addDominatedSize assumes 1 is the root node
@@ -551,15 +546,31 @@ pClusteredHeapGML clusteringStrategy path e = do
        traceFromM emptyTraceFunctions{closTrace = closTraceFunc} roots
 
     -- add transitive dominated size to nodes:
-    let nodes = addDominatedSize nodes0 edges
+    let (nodes, dominatedEdges_all) = addDominatedSize nodes0 edges
 
     let (edgesToWrite, nodesToWrite) = buildClusteredGraph nodes edges clusteringStrategy
 
+    -- Now we need to filter out any missing/combined nodes from dominator tree edges
+    -- this is weird...
+    let dominatedEdges = filter (\(n0,n1,_)-> all (`Map.member` nodeMap) [n0,n1]) dominatedEdges_all
+            where nodeMap = Map.fromList $ map ( \((_,_,_,ix),_,_,_)-> (ix,()) ) nodesToWrite
+
     unsafeLiftIO $ do
       hPutStrLn stderr "!!!!! Start writing to file !!!!!"
+
+      let path = pathNoExtension<>".gml"
+      outHandle <- openFile path WriteMode
       writeToFile nodesToWrite edgesToWrite outHandle
-      hPutStrLn stderr $ "!!!!! Done writing "<>path<> " !!!!!"
       hClose outHandle
+      hPutStrLn stderr $ "!!!!! Done writing regular graph at "<>path<> " !!!!!"
+
+      -- Write out a separate dominator tree graph (we'd really prefer if
+      -- graphia could just do this transform):
+      let domTreePath = pathNoExtension<>"dominator_tree.gml"
+      outHandleDomTree <- openFile domTreePath WriteMode
+      writeToFile nodesToWrite dominatedEdges outHandleDomTree
+      hClose outHandleDomTree
+      hPutStrLn stderr $ "!!!!! Done writing dominator tree graph at "<>domTreePath<> " !!!!!"
 
   where
     writeToFile
@@ -731,16 +742,18 @@ buildClusteredGraph nodes edges = \case
 addDominatedSize :: (Ord k) => 
     Map.Map k ((a, b, c, Int32), Size) -> 
     Map.Map (k, k) x ->
-    Map.Map k ((a, b, c, Int32), Size, Size)
+      ( Map.Map k ((a, b, c, Int32), Size, Size)
+      , [(Int32, Int32, Int)])
+      -- ^ Also return immediately-dominates relationship edges
 addDominatedSize nodes0 edges =
       -- NOTE: iDom returns reverse order from dominator tree edges:
-  let dominatedByEdges = FGL.iDom g 1
+  let dominatesEdges = map swap $ FGL.iDom g 1
 
       -- lazily accumulate transitive dominator sub-tree sizes
       -- leaves will be missing, but their sizes accounted for
       transSizes = 
           let domNodesChilds :: Map.Map Int [Int] 
-              domNodesChilds = Map.fromListWith (<>) $ map (fmap pure . swap) dominatedByEdges
+              domNodesChilds = Map.fromListWith (<>) $ map (fmap pure) dominatesEdges
            in Map.mapWithKey accum domNodesChilds
           where accum parent children = sizeOf parent + (sum $ map transSizeOf children)
 
@@ -750,7 +763,10 @@ addDominatedSize nodes0 edges =
 
       annotate xsz@(x, sz) = (x, sz, transSizeOf $ getNodeId xsz)
 
-   in fmap annotate nodes0
+      -- back to our Int32 keys; just put 0 for count for now (FIXME):
+      dominatesEdges32 = map (\(src, dest) -> (fromIntegral src, fromIntegral dest, 0)) dominatesEdges
+
+   in (fmap annotate nodes0, dominatesEdges32)
    where
       getKey i = getNodeId $ fromJust $ Map.lookup i nodes0
       getNodeId ((_, _, _, iptr32), _) = fromIntegral iptr32
@@ -780,4 +796,4 @@ test_addDominatedSize =
                 (5,(((),(),(),5),Size {getSize = 5},Size {getSize = 5})),
                 (6,(((),(),(),6),Size {getSize = 6},Size {getSize = 6}))]
 
-     in expected == addDominatedSize nodes edges
+     in expected == fst (addDominatedSize nodes edges)
