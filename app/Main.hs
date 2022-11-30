@@ -41,6 +41,7 @@ import qualified Data.IntMap as IM
 -- import Data.Traversable
 import Data.Kind
 import Data.Tuple
+import Data.Word
 
 -- import System.Process
 import System.Environment
@@ -49,7 +50,7 @@ import Data.Tree
 import Data.Maybe
 import Data.Either
 import Control.Arrow (first, (***), (&&&))
-import qualified Data.Map as Map
+import qualified Data.Map.Strict as Map
 -- import Data.Ord
 import Data.List
 import Data.Function
@@ -83,7 +84,8 @@ main = do
          -- pRetainingThunks
          -- pDominators lim
          -- pFragmentation
-         pClusteredHeapGML (ClusterBySourceInfo False) "/tmp/per-infoTable-byLoc"
+         -- pClusteredHeapGML (ClusterBySourceInfo False) "/tmp/per-infoTable-byLoc"
+         pAnalyzePointerCompression
 
      ("--take-snapshot":mbSocket) -> do
        let sockPath = case mbSocket of
@@ -803,3 +805,142 @@ test_addDominatedSize =
                 (6,(((),(),(),6),Size {getSize = 6},Size {getSize = 6},()))]
 
      in expected == fst (addDominatedSize nodes edges)
+
+-- ================================================================================
+
+data AnalyzePointerCompressionStats = AnalyzePointerCompressionStats {
+       infoTableMin :: Word64
+     , infoTableMax :: Word64
+     , infoPointers :: Map.Map Word64 Int
+     , lastPointingNext :: Int
+     -- ^ number of last-in-object pointers pointing to next adjacent heap object
+     , histFirst :: Map.Map Int Int
+     , histLast :: Map.Map Int Int
+     , histOffs :: Map.Map (Int, Int) Int
+     , histMaxOffs :: Map.Map (Int, Int) Int
+     } deriving (Show, Eq)
+
+emptyAnalyzePointerCompressionStats :: AnalyzePointerCompressionStats
+emptyAnalyzePointerCompressionStats =
+    AnalyzePointerCompressionStats maxBound minBound mempty 0 mempty mempty mempty mempty
+
+pAnalyzePointerCompression :: Debuggee -> IO ()
+pAnalyzePointerCompression e = do
+  pause e
+  runTrace e $ do
+    _bs <- precacheBlocks
+    liftIO $ hPutStrLn stderr "!!!!! Done precacheBlocks !!!!!"
+    roots <- gcRoots
+    liftIO $ hPutStrLn stderr "!!!!! Done gcRoots !!!!!"
+
+    -- Use state to collect:
+    --   - range of info tables
+    --   - histograms of offsets of first and last pointer field in closure (if any)
+    --   - histogram of offsets for every field
+    --   - histogram of `maximum offsets`, where 'offsets' are all the pointer fields in a closure
+    --   ...the latter two also keyed by number of child pointers, up to 6+
+    AnalyzePointerCompressionStats{..} 
+       <- flip execStateT emptyAnalyzePointerCompressionStats $
+            traceFromM emptyTraceFunctions{closTrace = closTraceFunc} roots
+
+    -- --------- Output and analysis:
+    liftIO $ do
+        let infoTableRange :: Double
+            infoTableRange = fromIntegral $ infoTableMax - infoTableMin
+        putStrLn $ "infotables + code range, in bits: "<> (show $ logBase 2 infoTableRange)
+        print infoPointers   -- < lots of output
+        putStrLn "* offset bits buckets for first and last pointers:"
+        print histFirst
+        print histLast
+        putStrLn "* count of final heap pointers pointing to adjacent heap object to the right:"
+        print lastPointingNext
+        putStrLn "* count of heap pointers by (offset bits bucket, pointers in closure):"
+        print histOffs
+        putStrLn "* count of closures by (offset bits reqd. for all fields, pointers in closure):"
+        print histMaxOffs
+  where
+    closTraceFunc (UntaggedClosurePtr ptr) (DCS (Size size) clos) continue = do
+      AnalyzePointerCompressionStats{..} <- get
+      -- TODO return max/min iptr (then summarize range)
+      let (InfoTablePtr iptr) = tableId $ info clos
+          !infoTableMax' = max infoTableMax iptr
+          !infoTableMin' = min infoTableMin iptr
+          -- just collect all info pointers, to see what's really going on:
+          -- (expect most counts to be 1 due to distinct-info-tables):
+          !infoPointers' = Map.insertWith (+) iptr 1 infoPointers
+
+      toPtrs <- fmap reverse $ lift $ flip execStateT [] $
+          -- Here we go one hop further to get this closure's pointers
+          void $ flip (quadtraverse pure pure pure) clos $ \(UntaggedClosurePtr toPtr)-> do
+              ptrStack <- get
+              put (toPtr:ptrStack)
+
+      -- the last bucket indicates "six or more pointers"
+      let !numFieldsBucket = min 6 $ length toPtrs
+
+      -- stats on the first and last heap pointers of a closure
+      let goHistFirstLast mp = \case
+              [] -> histFirst
+              (toPtr:_) ->
+                let bucket = offsetFromPtrBucket toPtr
+                 in Map.insertWith (+) bucket 1 mp 
+      let !histFirst' = goHistFirstLast histFirst toPtrs
+      let !histLast' = goHistFirstLast histLast $ reverse toPtrs
+
+      -- histogram of heap pointers on an individual basis, bucketed by offset
+      -- distance and number of sibling pointers:
+      let !histOffs' = foldl' (flip go) histOffs toPtrs where
+            go toPtr = Map.insertWith (+) bucket 1 where
+              bucket = (offsetFromPtrBucket toPtr, numFieldsBucket)
+      
+      -- ...whereas if all child pointers of a closure had to be equal sized
+      -- and signed, what size would we need for all the pointers in this
+      -- closure? (these will all be positive bit width buckets):
+      let !histMaxOffs' = insrt $ map offsetFromPtrBucket toPtrs
+            where insrt [] = histMaxOffs
+                  insrt offs
+                    -- ...turns out not:
+                    -- | any (<=0) offs = error "I really don't think we expect non-positive offsets here!"
+                    | otherwise = Map.insertWith (+) (maximum $ map abs offs, numFieldsBucket) 1 histMaxOffs
+
+      -- how many pointers are there that are: 1) last, and 2) point to the
+      -- immediately adjacent heap object?:
+      -- NOTE: first is about the same, but actually has a smaller count here...
+      --       I'm not sure why that should be... I guess if scav/evac is a
+      --       breadth-first traversal then we only get a tail that is compact
+      --       (except for singe-pointer closures)?
+      let lastPointingNext' = lastPointingNext + case reverse toPtrs of
+            (toPtr:_) | toPtr - ptr == fromIntegral size -> 1
+            _                                            -> 0
+
+      put AnalyzePointerCompressionStats {
+            infoTableMin = infoTableMin', 
+            infoTableMax = infoTableMax', 
+            infoPointers = infoPointers', 
+            lastPointingNext = lastPointingNext', 
+            histFirst = histFirst', 
+            histLast = histLast', 
+            histOffs = histOffs', 
+            histMaxOffs = histMaxOffs'
+            }
+
+      continue
+      where
+        -- We'll use buckets for 1-, 2-, 4-, and 8-byte range (positive and
+        -- negative). We'll leave two extra bits for tags: one for what we'd lose
+        -- if heap closures became 4-byte-aligned, and one for a
+        -- possibly-required sign bit or another tag.
+        -- (we shouldn't actually have any negative offsets I think... these would
+        -- be in remembered set otherwise?)
+        bitBuckets = [6, 14, 30]
+        offsetFromPtrBucket :: Word64 -> Int
+        offsetFromPtrBucket toPtr = signum offs * goBucket (abs offs) bitBuckets where
+            goBucket _ []       = 64
+            goBucket offsPos (l:ls)
+              | offsPos <= 2^l  = l
+              | otherwise       = goBucket offsPos ls
+
+            -- distance (possibly negative) from `ptr` to `toPtr`
+            offs :: Int
+            offs = fromIntegral toPtr - fromIntegral ptr
+
