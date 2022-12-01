@@ -34,7 +34,7 @@ import Control.Exception
 import Control.Concurrent
 -- import Control.Concurrent.Async
 -- import qualified Control.Concurrent.Chan.Unagi.Bounded as Bounded
-import qualified Data.IntMap as IM
+import qualified Data.IntMap.Strict as IM
 -- import Data.Bitraversable
 -- import Data.Monoid
 -- import Control.Applicative
@@ -808,21 +808,37 @@ test_addDominatedSize =
 
 -- ================================================================================
 
+-- | A value of N means: this pointer needs at least N bits (plus a sign bit)
+-- if represented as an /offset/ from the closure header
+type BitWidthBucket = Int
+
 data AnalyzePointerCompressionStats = AnalyzePointerCompressionStats {
        infoTableMin :: Word64
      , infoTableMax :: Word64
      , infoPointers :: Map.Map Word64 Int
      , lastPointingNext :: Int
      -- ^ number of last-in-object pointers pointing to next adjacent heap object
-     , histFirst :: Map.Map Int Int
-     , histLast :: Map.Map Int Int
-     , histOffs :: Map.Map (Int, Int) Int
-     , histMaxOffs :: Map.Map (Int, Int) Int
+     , histFirst :: Map.Map BitWidthBucket Int
+     , histLast :: Map.Map BitWidthBucket Int
+      -- ^ stats on the first and last heap pointers of a closure
+     , histOffs :: Map.Map (BitWidthBucket, Int) Int
+      -- ^ histogram of heap pointers on an individual basis, bucketed by offset
+      -- distance and number of sibling pointers:
+     , histMaxOffs :: Map.Map (BitWidthBucket, Int) Int
+      -- ^ ...whereas if all child pointers of a closure had to be equal sized
+      -- signed ints, what size would we need for all the pointers in this
+      -- closure? (these will all be positive bit width buckets):
+     , blockGraph :: IM.IntMap (Map.Map Int Int)
+      -- ^ a graph from block to block, where we make an edge if any heap
+      -- pointer in the source block points to the destination block. Mark the
+      -- edge with a count. Limit edges to maxBlockGraphEdgesToRecord (i.e.
+      -- `Map int Int` of size maxBlockGraphEdgesToRecord means,
+      -- "maxBlockGraphEdgesToRecord or more"). Includes self edges
      } deriving (Show, Eq)
 
 emptyAnalyzePointerCompressionStats :: AnalyzePointerCompressionStats
 emptyAnalyzePointerCompressionStats =
-    AnalyzePointerCompressionStats maxBound minBound mempty 0 mempty mempty mempty mempty
+    AnalyzePointerCompressionStats maxBound minBound mempty 0 mempty mempty mempty mempty mempty
 
 pAnalyzePointerCompression :: Debuggee -> IO ()
 pAnalyzePointerCompression e = do
@@ -845,10 +861,8 @@ pAnalyzePointerCompression e = do
 
     -- --------- Output and analysis:
     liftIO $ do
-        let infoTableRange :: Double
-            infoTableRange = fromIntegral $ infoTableMax - infoTableMin
-        putStrLn $ "infotables + code range, in bits: "<> (show $ logBase 2 infoTableRange)
-        print infoPointers   -- < lots of output
+        putStrLn "========= Raw output ======================================"
+        -- print infoPointers   -- < lots of output
         putStrLn "* offset bits buckets for first and last pointers:"
         print histFirst
         print histLast
@@ -858,8 +872,79 @@ pAnalyzePointerCompression e = do
         print histOffs
         putStrLn "* count of closures by (offset bits reqd. for all fields, pointers in closure):"
         print histMaxOffs
+
+        putStrLn "========= Analysis   ======================================"
+        let infoTableRange :: Double
+            infoTableRange = fromIntegral $ infoTableMax - infoTableMin
+        putStrLn $ "infotables + code range, in bits: "<> (show $ logBase 2 infoTableRange)
+
+        putStrLn "----------------------------------"
+        let (pos,neg) = (f *** f) $ partition ((>0) . fst . fst) $ Map.toList histOffs
+              where f = sum . map snd
+        putStrLn $ "Percentage of pointers representable as positive offset: " 
+                <>show (pct pos (pos+neg))
+
+        putStrLn "----------------------------------"
+        let pointersByObjectSizeMembership =
+              Map.fromListWith (+) $ map (first snd) $ Map.toList histOffs
+            totalPointersCnt = sum pointersByObjectSizeMembership
+        putStrLn $ "Out of "<>show totalPointersCnt<>" total heap pointers..."
+        F.for_ (Map.toList pointersByObjectSizeMembership) $ \(ptrFields, cnt) -> do
+            let end | ptrFields == 6 = " 6 or more sibling pointers"
+                    | otherwise = " "<>show ptrFields<>" sibling pointers"
+            putStrLn $ "  ..."<>show (pct cnt totalPointersCnt)<>"% of heap pointers are in objects with"<>end
+
+        putStrLn "----------------------------------"
+        let closuresByObjectSize =
+              Map.fromListWith (+) $ map (first snd) $ Map.toList histMaxOffs
+            totalClosCount = sum closuresByObjectSize
+        putStrLn $ "Out of "<>show totalClosCount<>" total closures..."
+        F.for_ (Map.toList closuresByObjectSize) $ \(ptrFields, cnt) -> do
+            let end | ptrFields == 6 = " 6 or pointer fields"
+                    | otherwise = " "<>show ptrFields<>" pointer fields"
+            putStrLn $ "  ..."<>show (pct cnt totalClosCount)<>"% have"<>end
+
+        putStrLn "----------------------------------"
+        -- we'll assume 6 or more to be exactly six
+        -- (here and elsewhere assume x86_64)
+        putStrLn "Conservative estimate of size of heap pointers + info pointers:"
+        let totalPtrBytes = 
+                -- 1 Word for info pointer 1 word for each ptr field
+                foldl' (\n (ptrFields,cnt)-> n + ((8*cnt)*(1 + ptrFields))) 0 $ 
+                  Map.toList closuresByObjectSize
+        putStrLn $ "   "<>show (totalPtrBytes `div` (1000*1000))<>" MB"
+
+        putStrLn "----------------------------------"
+        putStrLn "If all heap pointers in an object must have same width compressed (i.e. as offset),"
+        let closuresByOffsetBits =
+              Map.fromListWith (+) $ map (first fst) $ Map.toList histMaxOffs
+        F.for_ (Map.toList closuresByOffsetBits) $ \(bitWidth, cnt) -> do
+            putStrLn $ "  ... "<>show (pct cnt totalClosCount)<> "% of closures could use offsets of width "
+             <>show (min 64 (bitWidth+2)) -- make these normal word sizes
+
+        putStrLn "----------------------------------"
+        let numBlocks = IM.size blockGraph
+            blockEdges = Map.fromListWith (+) $ 
+                map (\(_blk, outEdges) -> (Map.size outEdges, 1::Int)) $ IM.toList blockGraph
+        putStrLn $ "Out of "<>show numBlocks<>" blocks..."
+        F.for_ (Map.toList blockEdges) $ \(numOutEdges, countOfSuchBlocks) -> do
+          if numOutEdges == maxBlockGraphEdgesToRecord
+             then
+                putStrLn $ "    ... "<>show (pct countOfSuchBlocks numBlocks)<>"% have edges to "
+                         <>show numOutEdges<>" or more other blocks"
+             else
+                putStrLn $ "    ... "<>show (pct countOfSuchBlocks numBlocks)<>"% have edges to exactly "
+                         <>show numOutEdges<>" distinct other blocks"
+
+
   where
-    closTraceFunc (UntaggedClosurePtr ptr) (DCS (Size size) clos) continue = do
+    pct :: Integral n=> n -> n -> Int
+    pct num den = round ((fromIntegral num / fromIntegral den)*100::Float)
+
+    -- so we don't blow up memory
+    maxBlockGraphEdgesToRecord = 20
+
+    closTraceFunc cp@(UntaggedClosurePtr ptr) (DCS (Size size) clos) continue = do
       AnalyzePointerCompressionStats{..} <- get
       -- TODO return max/min iptr (then summarize range)
       let (InfoTablePtr iptr) = tableId $ info clos
@@ -909,9 +994,16 @@ pAnalyzePointerCompression e = do
       --       I'm not sure why that should be... I guess if scav/evac is a
       --       breadth-first traversal then we only get a tail that is compact
       --       (except for singe-pointer closures)?
-      let lastPointingNext' = lastPointingNext + case reverse toPtrs of
+      let !lastPointingNext' = lastPointingNext + case reverse toPtrs of
             (toPtr:_) | toPtr - ptr == fromIntegral size -> 1
             _                                            -> 0
+
+      let !blockGraph' = foldl' (flip $ IM.insertWith ins ourBlock) blockGraph $ map toSingletonMap toPtrs
+            where (ourBlock, _) = getKeyPair cp
+                  ins newSingleMap existingMap
+                    | Map.size existingMap >= maxBlockGraphEdgesToRecord = existingMap
+                    | otherwise = Map.unionWith (+) newSingleMap existingMap
+                  toSingletonMap toPtr = Map.fromList [(fst $ getKeyPair $ UntaggedClosurePtr toPtr, 1)]
 
       put AnalyzePointerCompressionStats {
             infoTableMin = infoTableMin', 
@@ -921,17 +1013,16 @@ pAnalyzePointerCompression e = do
             histFirst = histFirst', 
             histLast = histLast', 
             histOffs = histOffs', 
-            histMaxOffs = histMaxOffs'
+            histMaxOffs = histMaxOffs',
+            blockGraph = blockGraph'
             }
 
       continue
       where
         -- We'll use buckets for 1-, 2-, 4-, and 8-byte range (positive and
-        -- negative). We'll leave two extra bits for tags: one for what we'd lose
-        -- if heap closures became 4-byte-aligned, and one for a
+        -- negative). We'll leave two extra bits for tags: one for what we'd
+        -- lose if heap objects became 4-byte-aligned, and one for a
         -- possibly-required sign bit or another tag.
-        -- (we shouldn't actually have any negative offsets I think... these would
-        -- be in remembered set otherwise?)
         bitBuckets = [6, 14, 30]
         offsetFromPtrBucket :: Word64 -> Int
         offsetFromPtrBucket toPtr = signum offs * goBucket (abs offs) bitBuckets where
@@ -944,3 +1035,10 @@ pAnalyzePointerCompression e = do
             offs :: Int
             offs = fromIntegral toPtr - fromIntegral ptr
 
+-- copied from GHC.Debug.Trace:
+getKeyPair :: ClosurePtr -> (Int, Word16)
+getKeyPair cp =
+  let BlockPtr raw_bk = applyBlockMask cp
+      bk = fromIntegral raw_bk `div` 8
+      offset = getBlockOffset cp `div` 8
+  in (bk, fromIntegral offset)
