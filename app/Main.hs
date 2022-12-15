@@ -1051,8 +1051,12 @@ getKeyPair cp =
 -- https://gitlab.haskell.org/ghc/ghc/-/wikis/nested-closures 
 -- https://gitlab.haskell.org/ghc/ghc/-/wikis/Sharing-Closure-Environments-in-STG 
 
+-- For:         (!visited, !pointersTotal, !identicalPtrs):
 -- (50774469, _       , 11396500) = for all closure types, before Rules shrunk
+--
 -- (31967878, 88165269, 33285652)   ...and after
+-- (15467397, 51118660, 31381916) = for just parents that isFunLike
+-- (15467397, 51118660, 31367929) = for parent and child that isFunLike
 pAnalyzeNestedClosureFreeVars :: Debuggee -> IO ()
 pAnalyzeNestedClosureFreeVars e = do
   pause e
@@ -1071,21 +1075,31 @@ pAnalyzeNestedClosureFreeVars e = do
   where
     closTraceFunc _parentPtr (DCS _ parentClos) continue = do
 
-      parentClosPtrs <- getAllPtrs parentClos
+      when (isFunLike parentClos || analyzeAllClosureTypes) $ do
+          parentClosPtrs <- getAllPtrs parentClos
 
-      (!visited, !pointersTotal, !identicalPtrs) <- get
+          (!visited, !pointersTotal, !identicalPtrs) <- get
 
-      childPointersInParent <- lift $ flip execStateT 0 $
-          -- for each of our pointers...
-          void $ flip (quadtraverse pure pure pure) parentClos $ \ toPtr-> do
-            n <- get
-            -- ...follow and collect child's pointers
-            (DCS _ childClos) <- lift $ dereferenceClosure toPtr
-            childClosPtrs <- getAllPtrs childClos
-            put $! (n + Set.size (childClosPtrs `Set.intersection` parentClosPtrs))
+          childPointersInParent <- lift $ flip execStateT 0 $
+              -- for each of our pointers...
+              void $ flip (quadtraverse pure pure pure) parentClos $ \ toPtr-> do
+                n <- get
+                -- ...follow and collect child's pointers
+                (DCS _ childClos) <- lift $ dereferenceClosure toPtr
+                when (isFunLike childClos || analyzeAllClosureTypes) $ do
+                    childClosPtrs <- getAllPtrs childClos
+                    put $! (n + Set.size (childClosPtrs `Set.intersection` parentClosPtrs))
 
-      put (visited+1, pointersTotal+Set.size parentClosPtrs , identicalPtrs+childPointersInParent)
+          put (visited+1, pointersTotal+Set.size parentClosPtrs , identicalPtrs+childPointersInParent)
       continue
+
+    -- Do we want to analyze all closure types, regardless of whether they are function-like?
+    analyzeAllClosureTypes = False
+    
+    isFunLike = \case
+      FunClosure{} -> True
+      ThunkClosure{} -> True
+      _ -> False
 
     getAllPtrs clos = lift $ flip execStateT mempty $
           void $ flip (quadtraverse pure pure pure) clos $ \ ptr-> do
