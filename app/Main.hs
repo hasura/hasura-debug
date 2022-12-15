@@ -1066,8 +1066,8 @@ pAnalyzeNestedClosureFreeVars e = do
     roots <- gcRoots
     liftIO $ hPutStrLn stderr "!!!!! Done gcRoots !!!!!"
 
-    out@(_closuresVisited, _pointersTotal, _childPointersInParent)
-       <- flip execStateT (0::Int,0::Int,0::Int) $
+    out@(_closuresVisited, _pointersTotal, _childPointersInParent, _hist)
+       <- flip execStateT (0::Int,0::Int,0::Int, mempty::Map.Map (Int,Int) Int) $
             traceFromM emptyTraceFunctions{closTrace = closTraceFunc} roots
 
     liftIO $ print out
@@ -1078,19 +1078,28 @@ pAnalyzeNestedClosureFreeVars e = do
       when (isFunLike parentClos || analyzeAllClosureTypes) $ do
           parentClosPtrs <- getAllPtrs parentClos
 
-          (!visited, !pointersTotal, !identicalPtrs) <- get
+          -- childFieldsHist: (count_fields_in_closure, count_fields_in_closure in parent) -> count_of_closures_like_this
+          (!visited, !pointersTotal, !identicalPtrs, !childFieldsHist) <- get
 
-          childPointersInParent <- lift $ flip execStateT 0 $
+          (childPointersInParent, childFieldsHist_toAdd) <- lift $ flip execStateT (0, mempty) $
               -- for each of our pointers...
               void $ flip (quadtraverse pure pure pure) parentClos $ \ toPtr-> do
-                n <- get
+                (!childPointersInParent, !childFieldsHist_toAdd) <- get
                 -- ...follow and collect child's pointers
                 (DCS _ childClos) <- lift $ dereferenceClosure toPtr
                 when (isFunLike childClos || analyzeAllClosureTypes) $ do
                     childClosPtrs <- getAllPtrs childClos
-                    put $! (n + Set.size (childClosPtrs `Set.intersection` parentClosPtrs))
+                    let !ourPointersInParent = Set.size (childClosPtrs `Set.intersection` parentClosPtrs)
+                        !childPointers = Set.size childClosPtrs
+                    put $! (childPointersInParent+ourPointersInParent, 
+                            (childPointers, ourPointersInParent) : childFieldsHist_toAdd
+                           )
 
-          put (visited+1, pointersTotal+Set.size parentClosPtrs , identicalPtrs+childPointersInParent)
+          put (visited+1, 
+               pointersTotal+Set.size parentClosPtrs , 
+               identicalPtrs+childPointersInParent,
+               foldl' (\mp k-> Map.insertWith (+) k 1 mp) childFieldsHist childFieldsHist_toAdd
+              )
       continue
 
     -- Do we want to analyze all closure types, regardless of whether they are function-like?
