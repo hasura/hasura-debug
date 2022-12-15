@@ -64,6 +64,7 @@ import GHC.Int
 import qualified Data.Graph.Inductive.Graph as FGL
 import qualified Data.Graph.Inductive.PatriciaTree as FGL
 import qualified Data.Graph.Inductive.Query.Dominators as FGL
+import qualified Data.Set as Set
 
 
 -- Collect snapshot, stepping through so we have some control over memory usage:
@@ -85,7 +86,8 @@ main = do
          -- pDominators lim
          -- pFragmentation
          -- pClusteredHeapGML (ClusterBySourceInfo False) "/tmp/per-infoTable-byLoc"
-         pAnalyzePointerCompression
+         -- pAnalyzePointerCompression
+         pAnalyzeNestedClosureFreeVars
 
      ("--take-snapshot":mbSocket) -> do
        let sockPath = case mbSocket of
@@ -1042,3 +1044,50 @@ getKeyPair cp =
       bk = fromIntegral raw_bk `div` 8
       offset = getBlockOffset cp `div` 8
   in (bk, fromIntegral offset)
+
+
+-- ================================================================================
+-- https://gitlab.haskell.org/ghc/ghc/-/issues/14461 
+-- https://gitlab.haskell.org/ghc/ghc/-/wikis/nested-closures 
+-- https://gitlab.haskell.org/ghc/ghc/-/wikis/Sharing-Closure-Environments-in-STG 
+
+-- (50774469, _       , 11396500) = for all closure types, before Rules shrunk
+-- (31967878, 88165269, 33285652)   ...and after
+pAnalyzeNestedClosureFreeVars :: Debuggee -> IO ()
+pAnalyzeNestedClosureFreeVars e = do
+  pause e
+  runTrace e $ do
+    _bs <- precacheBlocks
+    liftIO $ hPutStrLn stderr "!!!!! Done precacheBlocks !!!!!"
+    roots <- gcRoots
+    liftIO $ hPutStrLn stderr "!!!!! Done gcRoots !!!!!"
+
+    out@(_closuresVisited, _pointersTotal, _childPointersInParent)
+       <- flip execStateT (0::Int,0::Int,0::Int) $
+            traceFromM emptyTraceFunctions{closTrace = closTraceFunc} roots
+
+    liftIO $ print out
+
+  where
+    closTraceFunc _parentPtr (DCS _ parentClos) continue = do
+
+      parentClosPtrs <- getAllPtrs parentClos
+
+      (!visited, !pointersTotal, !identicalPtrs) <- get
+
+      childPointersInParent <- lift $ flip execStateT 0 $
+          -- for each of our pointers...
+          void $ flip (quadtraverse pure pure pure) parentClos $ \ toPtr-> do
+            n <- get
+            -- ...follow and collect child's pointers
+            (DCS _ childClos) <- lift $ dereferenceClosure toPtr
+            childClosPtrs <- getAllPtrs childClos
+            put $! (n + Set.size (childClosPtrs `Set.intersection` parentClosPtrs))
+
+      put (visited+1, pointersTotal+Set.size parentClosPtrs , identicalPtrs+childPointersInParent)
+      continue
+
+    getAllPtrs clos = lift $ flip execStateT mempty $
+          void $ flip (quadtraverse pure pure pure) clos $ \ ptr-> do
+              ptrs <- get
+              put $! Set.insert ptr ptrs
