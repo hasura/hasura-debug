@@ -1066,14 +1066,31 @@ pAnalyzeNestedClosureFreeVars e = do
     roots <- gcRoots
     liftIO $ hPutStrLn stderr "!!!!! Done gcRoots !!!!!"
 
+    -- since I got tired of threading state below...
+    mutState <- liftIO $ newMVar (mempty :: Map.Map InfoTablePtr Int)
+
     out@(_closuresVisited, _pointersTotal, _childPointersInParent, _hist)
        <- flip execStateT (0::Int,0::Int,0::Int, mempty::Map.Map (Int,Int) Int) $
-            traceFromM emptyTraceFunctions{closTrace = closTraceFunc} roots
+            traceFromM emptyTraceFunctions{closTrace = closTraceFunc mutState} roots
 
     liftIO $ print out
+    liftIO $ putStrLn "==========================="
+    mp <- liftIO $ takeMVar mutState
+    forM_ (sort $ map swap $ Map.toList mp) $ \(cnt, tid) -> do
+        liftIO $ print ("COUNT", cnt)
+        getSourceInfo tid >>= mapM_ (liftIO . print)
+    liftIO $ putStrLn "==========================="
+    byLoc <- forM (Map.toList mp) $ \(tid, cnt) -> do
+        getSourceInfo tid >>= \case
+          Nothing -> return Nothing
+          Just si -> return $ Just (infoPosition si, cnt)
+    forM_ (reverse $ sort $ map swap $ Map.toList $ Map.fromListWith (+) $ catMaybes byLoc) $ \(cnt, pos) -> do
+        liftIO $ putStrLn pos
+        liftIO $ print ("COUNT", cnt)
+
 
   where
-    closTraceFunc _parentPtr (DCS _ parentClos) continue = do
+    closTraceFunc mutState _parentPtr (DCS _ parentClos) continue = do
 
       when (isFunLike parentClos || analyzeAllClosureTypes) $ do
           parentClosPtrs <- getAllPtrs parentClos
@@ -1094,6 +1111,10 @@ pAnalyzeNestedClosureFreeVars e = do
                     put $! (childPointersInParent+ourPointersInParent, 
                             (childPointers, ourPointersInParent) : childFieldsHist_toAdd
                            )
+                    when (childPointers == 1 && ourPointersInParent == 1) $ do
+                        let tid = tableId $ info childClos
+                        liftIO $ modifyMVar_ mutState $
+                            return . Map.insertWith (+) tid 1
 
           put (visited+1, 
                pointersTotal+Set.size parentClosPtrs , 
