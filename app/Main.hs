@@ -85,9 +85,9 @@ main = do
          -- pRetainingThunks
          -- pDominators lim
          -- pFragmentation
-         -- pClusteredHeapGML (ClusterBySourceInfo False) "/tmp/per-infoTable-byLoc"
+         pClusteredHeapGML (ClusterBySourceInfo False) "/tmp/per-infoTable-byLoc-NEW"
          -- pAnalyzePointerCompression
-         pAnalyzeNestedClosureFreeVars
+         -- pAnalyzeNestedClosureFreeVars
 
      ("--take-snapshot":mbSocket) -> do
        let sockPath = case mbSocket of
@@ -137,13 +137,15 @@ pFragmentation e = do
         [_,_] -> liftIO $ print "two retainers, skipping"
         [r] -> do
           cs <- dereferenceClosures r
-          cs' <- mapM (quadtraverse pure dereferenceConDesc pure pure) cs
+          cs' <- mapM (quintraverse pure pure dereferenceConDesc pure pure) cs
           locs <- mapM getSourceLoc cs'
           -- displayRetainerStack is arbitrary and weird...
           -- TODO could be cool to look for the last thunk in the list (highest up in retainer tree)
           -- TODO would be cool to call out the top-most line from our own codebase too
-          liftIO $ displayRetainerStack 
-            [ ("", zip cs' locs) ]
+          liftIO $ putStrLn "FIXME for 0.4!"
+          -- liftIO $ displayRetainerStack 
+          --   [ ("", zip cs' locs) ]
+
         _ -> error $ "findRetainersOf broken apparently"<>(show rs)
 
     return (bs, pinnedCensus, mblockCensus, blockCensus)
@@ -245,7 +247,7 @@ pWriteToGML path e = do
           -- Map over this closure's pointer arguments, recording an edge in
           -- our closure graph
           let sendEdge = Bounded.writeChan ioChanW . GMLEdge ptr
-          void $ quadtraverse pure pure pure sendEdge clos
+          void $ quintraverse pure pure pure pure sendEdge clos
       continue
 -}
 
@@ -501,6 +503,7 @@ emptyTraceFunctions :: (MonadTrans m, Monad (m DebugM))=> TraceFunctions m
 emptyTraceFunctions =
   TraceFunctions {
        papTrace = const (lift $ return ())
+     , srtTrace = const (lift $ return ())
      , stackTrace = const (lift $ return ())
      , closTrace = \_ _ -> id -- ^ Just recurse
      , visitedVal = const (lift $ return ())
@@ -510,7 +513,7 @@ emptyTraceFunctions =
 -- TODO add to ghc-debug
 deriving instance MonadIO DebugM
 
-getSourceLoc :: DebugClosureWithSize pap string s b -> DebugM (Maybe SourceInformation) 
+getSourceLoc :: DebugClosureWithSize srt pap string s b -> DebugM (Maybe SourceInformation) 
 getSourceLoc c = getSourceInfo (tableId (info (noSize c)))
 
 -- ================================================================================
@@ -667,7 +670,7 @@ pClusteredHeapGML clusteringStrategy pathNoExtension e = do
           -- Here we go one hop further to build (possibly to an already-visited 
           -- node which we wouldn't be able to reach via traceFromM)
           -- TODO this is probably slow, since we need to resolve the InfoTablePtr again to make an edge
-          void $ flip (quadtraverse pure pure pure) clos $ \toPtr-> do
+          void $ flip (quintraverse pure pure pure pure) clos $ \toPtr-> do
             (DCS _ toClos) <- lift $ dereferenceClosure toPtr
             let tidTarget = tableId $ info toClos
             -- Increase edge count tid -> tidTo by one, else add new edge
@@ -958,7 +961,7 @@ pAnalyzePointerCompression e = do
 
       toPtrs <- fmap reverse $ lift $ flip execStateT [] $
           -- Here we go one hop further to get this closure's pointers
-          void $ flip (quadtraverse pure pure pure) clos $ \(UntaggedClosurePtr toPtr)-> do
+          void $ flip (quintraverse pure pure pure pure) clos $ \(UntaggedClosurePtr toPtr)-> do
               ptrStack <- get
               put (toPtr:ptrStack)
 
@@ -1100,7 +1103,7 @@ pAnalyzeNestedClosureFreeVars e = do
 
           (childPointersInParent, childFieldsHist_toAdd) <- lift $ flip execStateT (0, mempty) $
               -- for each of our pointers...
-              void $ flip (quadtraverse pure pure pure) parentClos $ \ toPtr-> do
+              void $ flip (quintraverse pure pure pure pure) parentClos $ \ toPtr-> do
                 (!childPointersInParent, !childFieldsHist_toAdd) <- get
                 -- ...follow and collect child's pointers
                 (DCS _ childClos) <- lift $ dereferenceClosure toPtr
@@ -1132,6 +1135,6 @@ pAnalyzeNestedClosureFreeVars e = do
       _ -> False
 
     getAllPtrs clos = lift $ flip execStateT mempty $
-          void $ flip (quadtraverse pure pure pure) clos $ \ ptr-> do
+          void $ flip (quintraverse pure pure pure pure) clos $ \ ptr-> do
               ptrs <- get
               put $! Set.insert ptr ptrs
