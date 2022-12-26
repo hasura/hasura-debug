@@ -51,6 +51,7 @@ import Data.Maybe
 import Data.Either
 import Control.Arrow (first, (***), (&&&))
 import qualified Data.Map.Strict as Map
+import qualified Data.Map.Lazy as LazyMap
 -- import Data.Ord
 import Data.List
 import Data.Function
@@ -764,14 +765,14 @@ addDominatedSize nodes0 edges =
       -- lazily accumulate transitive dominator sub-tree sizes
       -- leaves will be missing, but their sizes accounted for
       transSizes = 
-          let domNodesChilds :: Map.Map Int [Int] 
-              domNodesChilds = Map.fromListWith (<>) $ map (fmap pure) dominatesEdges
-           in Map.mapWithKey accum domNodesChilds
+          let domNodesChilds :: LazyMap.Map Int [Int] 
+              domNodesChilds = LazyMap.fromListWith (<>) $ map (fmap pure) dominatesEdges
+           in LazyMap.mapWithKey accum domNodesChilds
           where accum parent children = sizeOf parent + (sum $ map transSizeOf children)
 
       transSizeOf nodeId = 
         fromMaybe (sizeOf nodeId) $ -- ...if it's a leaf of dominator tree
-          Map.lookup nodeId transSizes
+          LazyMap.lookup nodeId transSizes
 
       annotate xsz@(x, sz, ds) = (x, sz, transSizeOf $ getNodeId xsz, ds)
 
