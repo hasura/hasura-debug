@@ -42,4 +42,17 @@ executable hasura-debug
                       bytestring,
     hs-source-dirs:   app
     default-language: GHC2021
-    ghc-options: -Wall
+    ghc-options: -Wall -rtsopts -threaded "-with-rtsopts=-N"
+                 -fdistinct-constructor-tables
+                 -finfo-table-map
+                 -eventlog
+
+-- An example executable that can be analyzed
+executable example
+    hs-source-dirs:   example
+    main-is:          Main.hs
+    build-depends:    base ^>=4.16.1.0,
+                      ghc-debug-stub
+    ghc-options: -Wall -rtsopts -threaded "-with-rtsopts=-N" -O2
+    ghc-options: -fdistinct-constructor-tables -finfo-table-map
+       
