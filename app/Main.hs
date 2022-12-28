@@ -86,9 +86,11 @@ main = do
          -- pRetainingThunks
          -- pDominators lim
          -- pFragmentation
-         pClusteredHeapGML (ClusterBySourceInfo False) "/tmp/per-infoTable-byLoc-NEW"
+         -- pClusteredHeapGML (ClusterBySourceInfo False) "/tmp/per-infoTable-byLoc-NEW"
          -- pAnalyzePointerCompression
          -- pAnalyzeNestedClosureFreeVars
+         -- pInfoTableTree
+         pDistinctInfoTableAnalysis
 
      ("--take-snapshot":mbSocket) -> do
        let sockPath = case mbSocket of
@@ -645,6 +647,7 @@ pClusteredHeapGML clusteringStrategy pathNoExtension e = do
                 <> "]\n"
 
     closTraceFunc _ptr (DCS size clos) continue = do
+      -- TODO is info pointer included in `size`? It seems only STATIC closures have just 8 bytes
       (nodes, edges, iptr32) <- get
       let tid@(InfoTablePtr _iptr) = tableId $ info clos
 
@@ -942,7 +945,6 @@ pAnalyzePointerCompression e = do
                 putStrLn $ "    ... "<>show (pct countOfSuchBlocks numBlocks)<>"% have edges to exactly "
                          <>show numOutEdges<>" distinct other blocks"
 
-
   where
     pct :: Integral n=> n -> n -> Int
     pct num den = round ((fromIntegral num / fromIntegral den)*100::Float)
@@ -952,7 +954,6 @@ pAnalyzePointerCompression e = do
 
     closTraceFunc cp@(UntaggedClosurePtr ptr) (DCS (Size size) clos) continue = do
       AnalyzePointerCompressionStats{..} <- get
-      -- TODO return max/min iptr (then summarize range)
       let (InfoTablePtr iptr) = tableId $ info clos
           !infoTableMax' = max infoTableMax iptr
           !infoTableMin' = min infoTableMin iptr
@@ -1139,3 +1140,73 @@ pAnalyzeNestedClosureFreeVars e = do
           void $ flip (quintraverse pure pure pure pure) clos $ \ ptr-> do
               ptrs <- get
               put $! Set.insert ptr ptrs
+
+----------------------------------------------------------
+
+-- Most of the time does the parent info pointer uniquely determine the info pointer of child?
+pInfoTableTree :: Debuggee -> IO ()
+pInfoTableTree e = do
+  pause e
+  runTrace e $ do
+    _bs <- precacheBlocks
+    liftIO $ hPutStrLn stderr "!!!!! Done precacheBlocks !!!!!"
+    roots <- gcRoots
+    liftIO $ hPutStrLn stderr "!!!!! Done gcRoots !!!!!"
+
+    -- for each info pointer, store the first set of info-pointers for child objects seen
+    -- for subesquent objects, increment either the MATCH or NO_MATCH counters
+    mp <- flip execStateT mempty $ 
+       traceFromM emptyTraceFunctions{closTrace = closTraceFunc} roots
+    F.for_ (Map.elems mp) $ \(_, matchedCount, noMatchCount) -> do
+        liftIO $ print (matchedCount, noMatchCount)
+
+  where
+    closTraceFunc _ (DCS _ clos) continue = do
+      mp <- get
+      let (InfoTablePtr iptr) = tableId $ info clos
+
+      -- info pointers of each dereferenced child pointer
+      toIptrs <- fmap reverse $ lift $ flip execStateT [] $
+          void $ flip (quintraverse pure pure pure pure) clos $ \toPtr-> do
+              stack <- get
+              (DCS _ childClos) <- lift $ dereferenceClosure toPtr
+              let (InfoTablePtr childIptr) = tableId $ info childClos
+              put (childIptr:stack)
+      -- Don't bother if there are no pointers
+      unless (null toIptrs) $ do
+          let mp' = Map.insertWith merge iptr (toIptrs, 0::Int, 0::Int) mp
+              merge _ (toIptrs_already, !matchedCount, !noMatchCount)
+                | toIptrs_already == toIptrs = (toIptrs, matchedCount+1, noMatchCount)
+                | otherwise                  = (toIptrs, matchedCount, noMatchCount+1)
+          put $! mp'
+      continue
+
+----------------------------------------------------------
+
+-- some stuff about info tables:
+--   - how many are for static closures, vs dynamic?
+pDistinctInfoTableAnalysis :: Debuggee -> IO ()
+pDistinctInfoTableAnalysis e = do
+  pause e
+  runTrace e $ do
+    _bs <- precacheBlocks
+    liftIO $ hPutStrLn stderr "!!!!! Done precacheBlocks !!!!!"
+    roots <- gcRoots
+    liftIO $ hPutStrLn stderr "!!!!! Done gcRoots !!!!!"
+
+    (static, dynamic) <- flip execStateT (mempty, mempty) $ 
+       traceFromM emptyTraceFunctions{closTrace = closTraceFunc} roots
+    liftIO $ do
+        putStrLn "(static_count, dynamic_count):"
+        print (Set.size static, Set.size dynamic)
+
+  where
+    closTraceFunc _ (DCS (Size size) clos) continue = do
+      (!static, !dynamic) <- get
+      let (InfoTablePtr iptr) = tableId $ info clos
+
+      -- assume if closure is word-size it must be STATIC
+      if size == 8
+         then put (Set.insert iptr static, dynamic)
+         else put (static, Set.insert iptr dynamic)
+      continue
