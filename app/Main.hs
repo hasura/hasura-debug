@@ -90,7 +90,9 @@ main = do
          -- pAnalyzePointerCompression
          -- pAnalyzeNestedClosureFreeVars
          -- pInfoTableTree
-         pDistinctInfoTableAnalysis
+         -- pDistinctInfoTableAnalysis
+         -- pCommonPtrArgs
+         pPointersToPointers
 
      ("--take-snapshot":mbSocket) -> do
        let sockPath = case mbSocket of
@@ -1209,4 +1211,161 @@ pDistinctInfoTableAnalysis e = do
       if size == 8
          then put (Set.insert iptr static, dynamic)
          else put (static, Set.insert iptr dynamic)
+      continue
+
+----------------------------------------------------------
+
+-- “A simple algorithm for finding frequent elements in streams and bags”
+-- https://www.cs.umd.edu/class/spring2018/cmsc644/karp.pdf
+--
+-- We expect this to return all elements each composing greater than
+-- `1/(stateSize+1)` of the input, should any exist. e.g. when stateSize = 2
+-- and we have 99 elements, this will return any occurring more than 33 times.
+-- A second pass is required to get the actual counts for the candidates
+-- identified, if required.
+--
+-- (I try to match the pseudocode here, though it’s not terribly efficient)
+data FrequentElems a = FrequentElems
+    { excessCounts :: (Map.Map a Int)
+    -- ^ invariant: Map.size excessCounts <= stateSize
+    , stateSize :: Int
+    -- ^ static
+    } deriving (Show)
+
+emptyFrequentElems :: (Ord a)=> Int -> FrequentElems a
+emptyFrequentElems = FrequentElems mempty
+
+insertFrequentElems :: (Ord a)=> FrequentElems a -> a -> FrequentElems a
+insertFrequentElems FrequentElems{..} a =
+    let excessCounts' = Map.insertWith (+) a 1 excessCounts --now possibly over capacity
+     in if Map.size excessCounts' > stateSize
+           -- (implies we inserted a new value above)
+           then let excessCounts'' = Map.filter (> 0) $ 
+                      fmap (subtract 1) $ excessCounts'
+                 in FrequentElems excessCounts'' stateSize
+           else FrequentElems excessCounts' stateSize
+
+-- For each closure type (i.e. grouping by info pointer), How many of these
+-- exist with the same pointer arguments?
+pCommonPtrArgs :: Debuggee -> IO ()
+pCommonPtrArgs e = do
+  pause e
+  runTrace e $ do
+    _bs <- precacheBlocks
+    liftIO $ hPutStrLn stderr "!!!!! Done precacheBlocks !!!!!"
+    roots <- gcRoots
+    liftIO $ hPutStrLn stderr "!!!!! Done gcRoots !!!!!"
+
+    -- for each info pointer, select the candidates for most frequent pointer
+    -- argument occurrences
+    liftIO $ hPutStrLn stderr "Tracing to collect frequent elems candidates..."
+    candidatesByInfo <- flip execStateT (mempty :: Map.Map Word64 (FrequentElems [ClosurePtr])) $
+       traceFromM emptyTraceFunctions{closTrace = traceFreqCandidates} roots
+    -- For each of the candidates identified above, count the actual
+    -- occurrences of the potentially frequently-occurring closures,
+    -- incrementing either the MATCH or NO_MATCH counters
+    let candidatesKeys = fmap (Map.keys . excessCounts) candidatesByInfo
+    liftIO $ hPutStrLn stderr "Tracing again to count frequencies..."
+    mp <- flip execStateT mempty $ 
+       traceFromM emptyTraceFunctions{closTrace = traceCountFreq candidatesKeys} roots
+
+    -- filter out where just a single occurrences of that closure type, to reduce noise
+    let nonSingletons = Map.filter (\(x,y) -> x + y /= 0) mp
+        (matchesL, unmatchesL) = unzip $ Map.elems nonSingletons
+    liftIO $ do
+        print ("non-singleton info entries", length nonSingletons)
+        print ("matches total", sum matchesL)
+        print ("nonmatches total", sum unmatchesL)
+
+    let bigMatches = sort $ map (\(iptr,(matches,_)) -> (matches,iptr)) $ Map.toList $ Map.filter ((>10000) . fst) nonSingletons
+    F.for_ bigMatches $ \(matches, iptr) -> do
+      mbSourceInfo <- getSourceInfo $ InfoTablePtr iptr
+      liftIO $ print (matches, mbSourceInfo)
+    -- TODO
+    --   - for candidates:
+    --       excess counts + matched % + total count
+    --   - matches / non-matches totals
+
+  where
+    -- If we imagine the RTS can do some caching / hash consing,  how many
+    -- distinct closure configurations should we cache per-infotable entry?
+    -- This also corresponds with the guarantees outlined above wrt frequent
+    -- elements, e.g. 2 here means if there exists to elements did you compose
+    -- more than 33% of the total closures, both are guaranteed to be in the
+    -- cache  after we iterate over the heap.
+    cacheSize = 4
+    frequencySingleton = insertFrequentElems (emptyFrequentElems cacheSize)
+
+    -- get the potentially-frequent pointer arguments, by info table entry
+    traceFreqCandidates _ (DCS _ clos) continue = do
+      freqElemsMap <- get
+      let (InfoTablePtr iptr) = tableId $ info clos
+      -- child pointers of closure
+      toPtrs <- fmap reverse $ lift $ flip execStateT [] $
+          void $ flip (quintraverse pure pure pure pure) clos $ \toPtr-> do
+              stack <- get
+              put (toPtr:stack)
+
+      -- Don't bother if there are no pointers
+      unless (null toPtrs) $ do
+          let freqElemsMap' = Map.insertWith merge iptr (frequencySingleton toPtrs) freqElemsMap
+              merge _ freq = insertFrequentElems freq toPtrs
+          put $! freqElemsMap'
+      continue
+
+    -- actually count occurrence frequency of those candidates, on a second pass:
+    traceCountFreq candidatesKeys _ (DCS _ clos) continue = do
+      mp <- get
+      let (InfoTablePtr iptr) = tableId $ info clos
+      -- child pointers of closure
+      toPtrs <- fmap reverse $ lift $ flip execStateT [] $
+          void $ flip (quintraverse pure pure pure pure) clos $ \toPtr-> do
+              stack <- get
+              put (toPtr:stack)
+
+      case Map.lookup iptr candidatesKeys of
+        Just candidates -> do
+          let mp' = Map.insertWith merge iptr (0::Int, 0::Int) mp
+              -- mark whether this set of child pointers would have been cached
+              -- by any of the candidates:
+              merge _ (!matchedCount, !noMatchCount)
+                -- ...record pointer count...
+                | toPtrs `elem` candidates = (matchedCount+length toPtrs, noMatchCount)
+                | otherwise                = (matchedCount, noMatchCount+length toPtrs)
+                -- ...vs just closure count:
+                -- | toPtrs `elem` candidates = (matchedCount+1, noMatchCount)
+                -- | otherwise                = (matchedCount, noMatchCount+1)
+          put $! mp'
+        Nothing -> pure ()
+      continue
+
+
+----------------------------------------------------------
+
+-- 
+pPointersToPointers :: Debuggee -> IO ()
+pPointersToPointers e = do
+  pause e
+  runTrace e $ do
+    _bs <- precacheBlocks
+    liftIO $ hPutStrLn stderr "!!!!! Done precacheBlocks !!!!!"
+    roots <- gcRoots
+    liftIO $ hPutStrLn stderr "!!!!! Done gcRoots !!!!!"
+
+    (pointersToPointersCount, pointersToDoubleWordCount) <- flip execStateT (0::Int, 0::Int) $
+       traceFromM emptyTraceFunctions{closTrace} roots
+    liftIO $ print ("pointersToPointersCount", pointersToPointersCount)
+    liftIO $ print ("pointersToDoubleWordCount", pointersToDoubleWordCount)
+  where
+    closTrace _ (DCS _ clos) continue = do
+      -- how many child pointers are just dereference to pointers themselves?
+      void $ flip (quintraverse pure pure pure pure) clos $ \toPtr-> do
+        (pointersToPointersCount, pointersToDoubleWordCount) <- get
+        (DCS (Size childSize) _) <- lift $ dereferenceClosure toPtr
+        -- size should include info pointer, so this should work:
+        when (childSize == 8) $
+          -- I think true means this is a static object
+          put $! (pointersToPointersCount + 1, pointersToDoubleWordCount)
+        when (childSize == 16) $
+          put $! (pointersToPointersCount, pointersToDoubleWordCount+1)
       continue
