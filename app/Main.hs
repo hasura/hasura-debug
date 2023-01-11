@@ -87,12 +87,12 @@ main = do
          -- pDominators lim
          -- pFragmentation
          -- pClusteredHeapGML (ClusterBySourceInfo False) "/tmp/per-infoTable-byLoc-NEW"
-         -- pAnalyzePointerCompression
+         pAnalyzePointerCompression
          -- pAnalyzeNestedClosureFreeVars
          -- pInfoTableTree
          -- pDistinctInfoTableAnalysis
          -- pCommonPtrArgs
-         pPointersToPointers
+         -- pPointersToPointers
 
      ("--take-snapshot":mbSocket) -> do
        let sockPath = case mbSocket of
@@ -820,7 +820,8 @@ test_addDominatedSize =
 -- ================================================================================
 
 -- | A value of N means: this pointer needs at least N bits (plus a sign bit)
--- if represented as an /offset/ from the closure header
+-- if represented as an /offset/ from the closure header (or from the first
+-- child pointer, as in histSiblingOffs)
 type BitWidthBucket = Int
 
 data AnalyzePointerCompressionStats = AnalyzePointerCompressionStats {
@@ -835,6 +836,8 @@ data AnalyzePointerCompressionStats = AnalyzePointerCompressionStats {
      , histOffs :: Map.Map (BitWidthBucket, Int) Int
       -- ^ histogram of heap pointers on an individual basis, bucketed by offset
       -- distance and number of sibling pointers:
+     , histSiblingOffs :: Map.Map (BitWidthBucket, Int) Int
+     -- ^ (like above, but offset from the first sibling pointer value)
      , histMaxOffs :: Map.Map (BitWidthBucket, Int) Int
       -- ^ ...whereas if all child pointers of a closure had to be equal sized
       -- signed ints, what size would we need for all the pointers in this
@@ -845,12 +848,17 @@ data AnalyzePointerCompressionStats = AnalyzePointerCompressionStats {
       -- edge with a count. Limit edges to maxBlockGraphEdgesToRecord (i.e.
       -- `Map int Int` of size maxBlockGraphEdgesToRecord means,
       -- "maxBlockGraphEdgesToRecord or more"). Includes self edges
+     , histClosureSizes :: Map.Map Int Int
+      -- ^ size in bytes -> total size in bytes for all closures of this size
+      --
+      -- The largest bucket means "N and larger"
      } deriving (Show, Eq)
 
 emptyAnalyzePointerCompressionStats :: AnalyzePointerCompressionStats
 emptyAnalyzePointerCompressionStats =
-    AnalyzePointerCompressionStats maxBound minBound mempty 0 mempty mempty mempty mempty mempty
+    AnalyzePointerCompressionStats maxBound minBound mempty 0 mempty mempty mempty mempty mempty mempty mempty
 
+-- What are the prospective benefits of pointer compression on this heap?
 pAnalyzePointerCompression :: Debuggee -> IO ()
 pAnalyzePointerCompression e = do
   pause e
@@ -881,8 +889,12 @@ pAnalyzePointerCompression e = do
         print lastPointingNext
         putStrLn "* count of heap pointers by (offset bits bucket, pointers in closure):"
         print histOffs
+        putStrLn "* (NEW!) count of sibling heap pointers by (offset-from-first-sibling-pointer-val bits bucket, pointers in closure):"
+        print histSiblingOffs
         putStrLn "* count of closures by (offset bits reqd. for all fields, pointers in closure):"
         print histMaxOffs
+        putStrLn "* (NEW!) histogram of heap residency, by closure size (divide to get counts)"
+        print histClosureSizes
 
         putStrLn "========= Analysis   ======================================"
         let infoTableRange :: Double
@@ -986,6 +998,16 @@ pAnalyzePointerCompression e = do
       let !histOffs' = foldl' (flip go) histOffs toPtrs where
             go toPtr = Map.insertWith (+) bucket 1 where
               bucket = (offsetFromPtrBucket toPtr, numFieldsBucket)
+
+     -- TODO : 5 bytes + 3 bytes, where each of six nibbles represents size (in words) of successive children?? (16 words max each)
+      let !histSiblingOffs' = case toPtrs of
+              [] -> histSiblingOffs
+              (toPtr0:toPtrsN) -> foldl' (flip go) histSiblingOffs toPtrsN where
+                 go toPtr = Map.insertWith (+) bucket 1 where
+                   bucket = (offsetFromBucket toPtr0 toPtr, numFieldsBucket)
+
+      -- histogram of heap residency, by closure size (divide to get counts):
+      let !histClosureSizes' = Map.insertWith (+) (min size (16*8)) size histClosureSizes
       
       -- ...whereas if all child pointers of a closure had to be equal sized
       -- and signed, what size would we need for all the pointers in this
@@ -1022,8 +1044,10 @@ pAnalyzePointerCompression e = do
             histFirst = histFirst', 
             histLast = histLast', 
             histOffs = histOffs', 
+            histSiblingOffs = histSiblingOffs', 
             histMaxOffs = histMaxOffs',
-            blockGraph = blockGraph'
+            blockGraph = blockGraph',
+            histClosureSizes = histClosureSizes'
             }
 
       continue
@@ -1034,15 +1058,17 @@ pAnalyzePointerCompression e = do
         -- possibly-required sign bit or another tag.
         bitBuckets = [6, 14, 30]
         offsetFromPtrBucket :: Word64 -> Int
-        offsetFromPtrBucket toPtr = signum offs * goBucket (abs offs) bitBuckets where
+        offsetFromPtrBucket = offsetFromBucket ptr
+
+        offsetFromBucket refPtr toPtr = signum offs * goBucket (abs offs) bitBuckets where
             goBucket _ []       = 64
             goBucket offsPos (l:ls)
               | offsPos <= 2^l  = l
               | otherwise       = goBucket offsPos ls
 
-            -- distance (possibly negative) from `ptr` to `toPtr`
+            -- distance (possibly negative) from `refPtr` to `toPtr`
             offs :: Int
-            offs = fromIntegral toPtr - fromIntegral ptr
+            offs = fromIntegral toPtr - fromIntegral refPtr
 
 -- copied from GHC.Debug.Trace:
 getKeyPair :: ClosurePtr -> (Int, Word16)
