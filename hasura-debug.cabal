@@ -25,7 +25,9 @@ executable hasura-debug
     main-is:          Main.hs
 
     -- Modules included in this executable, other than Main.
-    -- other-modules:
+    other-modules:
+        FreeVarAnalysis
+        Util
 
     -- LANGUAGE extensions used by modules in this package.
     -- other-extensions:
@@ -55,4 +57,4 @@ executable example
                       ghc-debug-stub
     ghc-options: -Wall -rtsopts -threaded "-with-rtsopts=-N" -O2
     ghc-options: -fdistinct-constructor-tables -finfo-table-map
-       
+
