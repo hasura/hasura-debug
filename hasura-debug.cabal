@@ -28,6 +28,7 @@ executable hasura-debug
     other-modules:
         FreeVarAnalysis
         Util
+        ParTrace
 
     -- LANGUAGE extensions used by modules in this package.
     -- other-extensions:
@@ -42,12 +43,13 @@ executable hasura-debug
                       text,
                       ghc-heap,
                       bytestring,
+                      bitwise,
     hs-source-dirs:   app
     default-language: GHC2021
     ghc-options: -Wall -rtsopts -threaded "-with-rtsopts=-N"
                  -fdistinct-constructor-tables
                  -finfo-table-map
-                 -eventlog
+                 -eventlog -fexpose-all-unfoldings -fspecialise-aggressively
 
 -- An example executable that can be analyzed
 executable example

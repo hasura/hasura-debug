@@ -30,7 +30,6 @@ import qualified Data.Foldable as F
 
 -- import Control.Monad
 -- import Debug.Trace
-import Control.Exception
 import Control.Concurrent
 -- import Control.Concurrent.Async
 -- import qualified Control.Concurrent.Chan.Unagi.Bounded as Bounded
@@ -44,7 +43,6 @@ import Data.Tuple
 import Data.Word
 
 -- import System.Process
-import System.Environment
 import System.IO
 import Data.Tree
 import Data.Maybe
@@ -93,7 +91,7 @@ pFragmentation e = do
         [r] -> do
           cs <- dereferenceClosures r
           cs' <- mapM (quintraverse pure pure dereferenceConDesc pure pure) cs
-          locs <- mapM getSourceLoc cs'
+          _locs <- mapM getSourceLoc cs'
           -- displayRetainerStack is arbitrary and weird...
           -- TODO could be cool to look for the last thunk in the list (highest up in retainer tree)
           -- TODO would be cool to call out the top-most line from our own codebase too
