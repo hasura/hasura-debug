@@ -1,6 +1,6 @@
 {-# OPTIONS_GHC -fno-warn-orphans -Wno-unused-imports#-}
 {-# LANGUAGE LambdaCase, RecordWildCards #-}
-{-# LANGUAGE NamedFieldPuns #-}
+{-# LANGUAGE RecordPuns #-}
 module FreeVarAnalysis where
 
 import GHC.Debug.Client hiding (DebugM)
@@ -11,8 +11,7 @@ import GHC.Debug.Count (parCount)
 
 -- import GHC.Debug.Profile
 import GHC.Debug.Dominators (retainerSize)
--- import GHC.Debug.Trace
-import GHC.Debug.ParTrace
+import GHC.Debug.Trace
 -- import GHC.Debug.ObjectEquiv
 import Control.Monad.RWS
 -- import Control.Monad.Identity
@@ -121,19 +120,32 @@ pAnalyzeNestedClosureFreeVars e = do
     roots <- gcRoots
     liftIO $ hPutStrLn stderr "!!!!! Done gcRoots !!!!!"
 
-    -- If we want to know the size of the heap uncomment the two statements below.
-    -- census <- parCount roots
-    -- liftIO $ print census
+    census <- parCount roots
+    liftIO $ print census
 
     -- since I got tired of threading state below...
     mutState <- liftIO $ newMVar (mempty :: Map.Map InfoTablePtr Int)
 
-    let info_roots = map (ClosurePtrWithInfo Nothing) roots
-    let traceFunctions :: TraceFunctionsIO (Maybe SharingInfoResult) (SharingInfoResult)
-        traceFunctions = (emptyTraceFunctionsIO (const mempty)) {closTrace = parClosTraceFunc mutState}
     hist
-      --  <- traceParFromM emptyTraceFunctions{closTrace = parClosTraceFunc mutState} roots
-       <- traceParFromM traceFunctions info_roots
+       <- flip execStateT (mempty::SharingInfoResult) $
+            traceFromM emptyTraceFunctions{closTrace = closTraceFunc mutState} roots
+
+    -- liftIO $ print out
+    -- liftIO $ putStrLn "==========================="
+    -- liftIO $ putStrLn "== One pointer that is also in parent"
+    -- mp <- liftIO $ takeMVar mutState
+    -- forM_ (sort $ map swap $ Map.toList mp) $ \(cnt, tid) -> do
+    --     liftIO $ print ("COUNT", cnt)
+    --     getSourceInfo tid >>= mapM_ (liftIO . print)
+
+    -- liftIO $ putStrLn "==========================="
+    -- byLoc <- forM (Map.toList mp) $ \(tid, cnt) -> do
+    --     getSourceInfo tid >>= \case
+    --       Nothing -> return Nothing
+    --       Just si -> return $ Just (infoPosition si, cnt)
+    -- forM_ (reverse $ sort $ map swap $ Map.toList $ Map.fromListWith (+) $ catMaybes byLoc) $ \(cnt, pos) -> do
+    --     liftIO $ putStrLn pos
+    --     liftIO $ print ("COUNT", cnt)
 
     -- Interesting data from the histogram
     let intestingHistData = Map.filterWithKey
@@ -163,92 +175,96 @@ pAnalyzeNestedClosureFreeVars e = do
             let get_loc itbl = getSourceInfo $ tableId itbl
             prnt_loc <- get_loc par_itbl
             chld_loc <- get_loc child_itbl
-                            -- Basic info
             liftIO $ putStrLn $ "ptrs:" <> show our_ptrs <> " shared_ptrs:" <> show in_parent <> " ptrs saved potential:" <> show max_ptrs_saved <> "(wds)" <>
-                            -- Info about free variables
-                                -- " fv_infos:" <> show fv_info <>
-                                " parent:"<> maybe "" show prnt_loc <>
-                                " child:"<> maybe "" show chld_loc
+                                " fv_infos:" <> show fv_info <>
+                                " "<> maybe "" show prnt_loc <>
+                                " "<> maybe "" show chld_loc
             return $ ptr_sum + max_ptrs_saved
       max_saved <- foldM analyze_one 0 sorted_data
-      liftIO $ putStrLn $ "Max wds saved: " <> show max_saved <> show " (" <> show (div (max_saved*8) (1024^(2::Int))) <> "MB)"
+      liftIO $ putStrLn $ "Max wds saved: " <> show max_saved <> show " (" <> show (div max_saved (1024^(2::Int))) <> "MB)"
+
+
+
+      -- flip mapM_ (sorted_data) $ \(hist@(SharedClosureInfo _our_ptrs in_parent _is_thunk),count) -> do
+
+
 
   where
-    parClosTraceFunc :: mut_state_
+    closTraceFunc :: a
                   -> ClosurePtr
-                  -> (DebugClosureWithExtra x b d g i ClosurePtr)
-                  -> Maybe SharingInfoResult
-                  -> DebugM (Maybe SharingInfoResult,SharingInfoResult, DebugM () -> DebugM ())
-    parClosTraceFunc _mutState parentPtr (DCS _ parentClos) partial_result = do
-        child_infos <-
-                if (isFunLike parentClos || analyzeAllClosureTypes)
-                    then analyzeOneClosure parentPtr parentClos
-                    else pure []
+                  -> SizedClosure
+                  -> StateT SharingInfoResult DebugM b1
+                  -> StateT SharingInfoResult DebugM b1
+    closTraceFunc _mutState parentPtr (DCS _ parentClos) continue = do
 
-        let sharing_info = foldl' addSharingResult (fromMaybe mempty partial_result) child_infos
+      when (isFunLike parentClos || analyzeAllClosureTypes) $ do
+          parentClosPtrs <- getAllPtrs parentClos
+          let parent_itbl = info parentClos
 
-        return (Just sharing_info, sharing_info, id)
+          (!childFieldsHist) <- get
 
--- Do we want to analyze all closure types, regardless of whether they are function-like?
-analyzeAllClosureTypes :: Bool
-analyzeAllClosureTypes = False
+          (childFieldsHist_toAdd) <- lift $ flip execStateT (mempty) $
+              -- for each of our pointers...
+              void $ traverseSubClosures parentClos $ \ toPtr-> do
+                (!childFieldsHist_toAdd) <- get
 
-isThunk :: DebugClosure srt pap string s b -> Bool
-isThunk = \case
-  ThunkClosure{} -> True
-  _ -> False
+                -- ...follow and collect child's pointers
+                (DCS _ childClos) <- lift $ dereferenceClosure toPtr
+                let child_itbl = info childClos
+                -- If we have a closure containing a reference the "child" will look like it
+                -- shares all fvs with the parent but there is nothing we can do about it.
+                when (toPtr /= parentPtr &&
+                      (isFunLike childClos || analyzeAllClosureTypes))
+                      $ do
+                    childClosPtrs <- getAllPtrs childClos
+                    let !ourPointersInParent = (childClosPtrs `Set.intersection` parentClosPtrs)
+                        !outPointersInParentCnt = Set.size ourPointersInParent
+                        !childPointers = Set.size childClosPtrs
+                        !chld_is_thunk = isThunk childClos
 
-isFunLike :: DebugClosure srt pap string s b -> Bool
-isFunLike = \case
-  FunClosure{} -> True
-  ThunkClosure{} -> True -- Thunks might not evaluate to functions but they might.
-                          -- So including them seems reasonable.
-  _ -> False
-
--- getAllPtrs :: DebugClosure b d g i ClosurePtr
---               -> StateT
---                    (Int, Int, Int, LazyMap.Map SharedClosureInfo Int) DebugM (Set.Set ClosurePtr)
-getAllPtrs :: (Quintraversable m1, Monad m2) => m1 b d g i ClosurePtr -> m2 (Set.Set ClosurePtr)
-getAllPtrs clos = flip execStateT mempty $
-      void $ traverseSubClosures clos $ \ ptr-> do
-          ptrs <- get
-          put $! Set.insert ptr ptrs
-
-analyzeOneClosure :: p -> DebugClosure b d g i ClosurePtr -> DebugM [SharedClosureInfo]
-analyzeOneClosure _parentPtr parentClos = do
-    let parent_itbl = info parentClos
-
-    flip execStateT (mempty) $ do
-        parentClosPtrs <- getAllPtrs parentClos
-
-        -- for each of our pointers...
-        void $ traverseSubClosures parentClos $ \ toPtr-> do
-            (!childFieldsHist_toAdd) <- get
-
-            -- ...follow and collect child's pointers
-            (DCS _ childClos) <- lift $ dereferenceClosure toPtr
-            let child_itbl = info childClos
-            when ((isFunLike childClos || analyzeAllClosureTypes)) $ do
-                childClosPtrs <- getAllPtrs childClos
-                let !ourPointersInParent = (childClosPtrs `Set.intersection` parentClosPtrs)
-                    !outPointersInParentCnt = Set.size ourPointersInParent
-                    !childPointers = Set.size childClosPtrs
-                    !chld_is_thunk = isThunk childClos
-
-                when (outPointersInParentCnt > 0) $ do
-                    fv_infos <- forM (Set.elems ourPointersInParent) $ \shared_cls_ptr -> do
-                        (DCS _ shared_cls) <- lift $ dereferenceClosure shared_cls_ptr
+                    when (outPointersInParentCnt > 0) $ do
+                      fv_infos <- forM (Set.elems ourPointersInParent) $ \shared_cls -> do
+                        (DCS _ shared_cls) <- lift $ dereferenceClosure shared_cls
+                        -- let itbl = info shared_cls
                         src_loc <- lift $ getSourceInfo $ tableId $ info shared_cls
+                        -- liftIO $ putStrLn $ show (infoType <$> src_loc)
                         return (infoType <$> src_loc)
-                    let fv_info_set = Set.fromList $ catMaybes fv_infos
-                    let this_data = SharedClosureInfo {
-                        ptrs = childPointers,
-                        shared_with_parent = outPointersInParentCnt,
-                        is_thunk = chld_is_thunk,
-                        par_itbl= parent_itbl,
-                        child_itbl = child_itbl,
-                        fv_info = fv_info_set
-                        }
-                    let !histData = this_data : childFieldsHist_toAdd
-                    put $! histData
+                      let fv_info_set = Set.fromList $ catMaybes fv_infos
+                      let this_data = SharedClosureInfo {
+                          ptrs = childPointers,
+                          shared_with_parent = outPointersInParentCnt,
+                          is_thunk = chld_is_thunk,
+                          par_itbl= parent_itbl,
+                          child_itbl = child_itbl,
+                          fv_info = fv_info_set
+                          }
+                      let !histData = this_data : childFieldsHist_toAdd
+                      put $! histData
+
+          put $
+            foldl' addSharingResult childFieldsHist childFieldsHist_toAdd
+
+      continue
+
+    -- Do we want to analyze all closure types, regardless of whether they are function-like?
+    analyzeAllClosureTypes = False
+
+    isThunk = \case
+      ThunkClosure{} -> True
+      _ -> False
+
+    isFunLike = \case
+      FunClosure{} -> True
+      ThunkClosure{} -> True -- Thunks might not evaluate to functions but they might.
+                             -- So including them seems reasonable.
+      _ -> False
+
+    -- getAllPtrs :: DebugClosure b d g i ClosurePtr
+    --               -> StateT
+    --                    (Int, Int, Int, LazyMap.Map SharedClosureInfo Int) DebugM (Set.Set ClosurePtr)
+    getAllPtrs clos = lift $ flip execStateT mempty $
+          void $ traverseSubClosures clos $ \ ptr-> do
+              ptrs <- get
+              put $! Set.insert ptr ptrs
+
 ----------------------------------------------------------

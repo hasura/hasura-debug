@@ -15,7 +15,6 @@ import GHC.Debug.Snapshot
 import GHC.Debug.Types.Ptr
 --import GHC.Debug.Types.Closures
 import GHC.Debug.Trace
-import qualified GHC.Debug.ParTrace as ParTrace
 -- import GHC.Debug.ObjectEquiv
 import Control.Monad.RWS
 -- import Control.Monad.Identity
@@ -463,17 +462,6 @@ emptyTraceFunctions =
      , visitedVal = const (lift $ return ())
      , conDescTrace = const (lift $ return ())
    }
-
-emptyTraceFunctionsIO :: Monoid shared => (local -> shared) -> ParTrace.TraceFunctionsIO local shared
-emptyTraceFunctionsIO toShared =
-      ParTrace.TraceFunctionsIO
-      { papTrace  = const (return ())
-      , srtTrace = const (return ())
-      , stackTrace = const (return ())
-      , closTrace = \_ _ a -> return (a, toShared a, const (return ()))
-      , visitedVal = \_ a -> (return $ toShared a)
-      , conDescTrace = const (return ())
-      }
 
 -- TODO add to ghc-debug
 deriving instance MonadIO DebugM
