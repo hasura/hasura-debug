@@ -94,7 +94,17 @@ instance Eq SharedClosureInfo where
 instance Ord SharedClosureInfo where
   compare x y = compare (par_itbl x, child_itbl x) (par_itbl y, child_itbl y)
 
-type SharingInfoResult = LazyMap.Map SharedClosureInfo Int
+newtype SharingInfoResult = SharingInfoResult { unSharingInfoResult :: LazyMap.Map SharedClosureInfo Int }
+
+instance Semigroup SharingInfoResult where
+  (<>) :: SharingInfoResult -> SharingInfoResult -> SharingInfoResult
+  l <> r = SharingInfoResult $ Map.unionWith (+) (unSharingInfoResult l) (unSharingInfoResult r)
+
+instance Monoid SharingInfoResult where
+  mempty = SharingInfoResult mempty
+
+addSharingResult :: SharingInfoResult -> SharedClosureInfo -> SharingInfoResult
+addSharingResult (SharingInfoResult result_count) cl_info = SharingInfoResult $ Map.insertWith (+) cl_info 1 result_count
 
 -- traverseSubClosures
 traverseSubClosures :: (Quintraversable m, Applicative f)
@@ -116,8 +126,8 @@ pAnalyzeNestedClosureFreeVars e = do
     -- since I got tired of threading state below...
     mutState <- liftIO $ newMVar (mempty :: Map.Map InfoTablePtr Int)
 
-    _out@(_closuresVisited, _pointersTotal, _childPointersInParent, _hist)
-       <- flip execStateT (0::Int,0::Int,0::Int, mempty::Map.Map SharedClosureInfo Int) $
+    hist
+       <- flip execStateT (mempty::SharingInfoResult) $
             traceFromM emptyTraceFunctions{closTrace = closTraceFunc mutState} roots
 
     -- liftIO $ print out
@@ -148,7 +158,7 @@ pAnalyzeNestedClosureFreeVars e = do
                                   -- we would just replace a pointer to the payload
                                   -- with a pointer to the parent
                                   our_ptrs > 1)
-                              _hist
+                              $ unSharingInfoResult hist
     do
       liftIO $ putStrLn "==========================="
       liftIO $ putStrLn "== Sharing histogram"
@@ -156,7 +166,7 @@ pAnalyzeNestedClosureFreeVars e = do
       let analyze_one ptr_sum ((SharedClosureInfo
               { ptrs = our_ptrs
               , shared_with_parent = in_parent
-              , is_thunk
+              -- , is_thunk
               , par_itbl
               , child_itbl
               , fv_info}),count) = do
@@ -180,24 +190,23 @@ pAnalyzeNestedClosureFreeVars e = do
 
 
   where
-    closTraceFunc :: MVar (LazyMap.Map InfoTablePtr Int)
+    closTraceFunc :: a
                   -> ClosurePtr
                   -> SizedClosure
-                  -> StateT (Int, Int, Int, LazyMap.Map SharedClosureInfo Int) DebugM b1
-                  -> StateT (Int, Int, Int, LazyMap.Map SharedClosureInfo Int) DebugM b1
+                  -> StateT SharingInfoResult DebugM b1
+                  -> StateT SharingInfoResult DebugM b1
     closTraceFunc _mutState parentPtr (DCS _ parentClos) continue = do
 
       when (isFunLike parentClos || analyzeAllClosureTypes) $ do
           parentClosPtrs <- getAllPtrs parentClos
           let parent_itbl = info parentClos
 
-          -- childFieldsHist: (count_fields_in_closure, count_fields_in_closure in parent) -> count_of_closures_like_this
-          (!visited, !pointersTotal, !identicalPtrs, !childFieldsHist) <- get
+          (!childFieldsHist) <- get
 
-          (childPointersInParent, childFieldsHist_toAdd) <- lift $ flip execStateT (0, mempty) $
+          (childFieldsHist_toAdd) <- lift $ flip execStateT (mempty) $
               -- for each of our pointers...
               void $ traverseSubClosures parentClos $ \ toPtr-> do
-                (!childPointersInParent, !childFieldsHist_toAdd) <- get
+                (!childFieldsHist_toAdd) <- get
 
                 -- ...follow and collect child's pointers
                 (DCS _ childClos) <- lift $ dereferenceClosure toPtr
@@ -212,12 +221,6 @@ pAnalyzeNestedClosureFreeVars e = do
                         !outPointersInParentCnt = Set.size ourPointersInParent
                         !childPointers = Set.size childClosPtrs
                         !chld_is_thunk = isThunk childClos
-                        -- !itbls = if ourPointersInParent > 1
-                        --             then Map.singleton child_itbl 1
-                        --             else mempty
-                    let self_recursive = parentPtr `Set.member` childClosPtrs :: Bool
-
-                    -- when self_recursive $ do liftIO $ putStrLn "Self-recursive!"
 
                     when (outPointersInParentCnt > 0) $ do
                       fv_infos <- forM (Set.elems ourPointersInParent) $ \shared_cls -> do
@@ -236,19 +239,11 @@ pAnalyzeNestedClosureFreeVars e = do
                           fv_info = fv_info_set
                           }
                       let !histData = this_data : childFieldsHist_toAdd
-                      put $! (childPointersInParent+outPointersInParentCnt,
-                              histData
-                            )
-                    -- when (childPointers == 1 && outPointersInParentCnt == 1) $ do
-                    --     let tid = tableId $ info childClos
-                    --     liftIO $ modifyMVar_ mutState $
-                    --         return . Map.insertWith (+) tid 1
+                      put $! histData
 
-          put (visited+1,
-               pointersTotal+Set.size parentClosPtrs ,
-               identicalPtrs+childPointersInParent,
-               foldl' (\mp k-> Map.insertWith (+) k 1 mp) childFieldsHist childFieldsHist_toAdd
-              )
+          put $
+            foldl' addSharingResult childFieldsHist childFieldsHist_toAdd
+
       continue
 
     -- Do we want to analyze all closure types, regardless of whether they are function-like?
