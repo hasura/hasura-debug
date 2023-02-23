@@ -2,3 +2,4 @@ dist-newstyle/
 *.html
 *.eventlog
 *.hp
+cabal.project.local
