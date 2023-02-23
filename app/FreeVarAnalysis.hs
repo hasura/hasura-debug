@@ -66,6 +66,7 @@ import qualified Data.Set as Set
 
 import Util
 import Data.Foldable (Foldable(foldMap'))
+import GHC.Debug.Retainers (findRetainers)
 
 -- ================================================================================
 -- https://gitlab.haskell.org/ghc/ghc/-/issues/14461
@@ -79,6 +80,7 @@ import Data.Foldable (Foldable(foldMap'))
 -- (15467397, 51118660, 31381916) = for just parents that isFunLike
 -- (15467397, 51118660, 31367929) = for parent and child that isFunLike
 
+-- | Information about a kind of closure who might benefit from sharing FVs.
 data SharedClosureInfo =
     SharedClosureInfo
           { ptrs :: !Int
@@ -95,17 +97,38 @@ instance Eq SharedClosureInfo where
 instance Ord SharedClosureInfo where
   compare x y = compare (par_itbl x, child_itbl x) (par_itbl y, child_itbl y)
 
-newtype SharingInfoResult = SharingInfoResult { unSharingInfoResult :: LazyMap.Map SharedClosureInfo Int }
+-- | Aggreate data about closures
+newtype SharingInfoResult = SharingInfoResult { unSharingInfoResult :: LazyMap.Map SharedClosureInfo SharingSample }
 
 instance Semigroup SharingInfoResult where
   (<>) :: SharingInfoResult -> SharingInfoResult -> SharingInfoResult
-  l <> r = SharingInfoResult $ Map.unionWith (+) (unSharingInfoResult l) (unSharingInfoResult r)
+  l <> r = SharingInfoResult $ Map.unionWith (<>) (unSharingInfoResult l) (unSharingInfoResult r)
 
 instance Monoid SharingInfoResult where
   mempty = SharingInfoResult mempty
 
-addSharingResult :: SharingInfoResult -> SharedClosureInfo -> SharingInfoResult
-addSharingResult (SharingInfoResult result_count) cl_info = SharingInfoResult $ Map.insertWith (+) cl_info 1 result_count
+data SharingSample = SharingSample
+  { sample_samples :: (Set.Set ClosurePtr)
+  , sample_count :: !Int
+  } deriving (Show)
+
+sampleLimit :: Int
+sampleLimit = 5
+
+instance Semigroup SharingSample where
+  (SharingSample samples_x count_x) <> (SharingSample samples_y count_y)
+    = SharingSample samples (count_x + count_y)
+    where
+      samples
+        | Set.size samples_x >= sampleLimit = samples_x
+        | Set.size samples_y >= sampleLimit = samples_y
+        | otherwise = Set.fromList $ take sampleLimit (Set.toList samples_x <> Set.toList samples_y)
+
+instance Monoid SharingSample where
+  mempty = SharingSample mempty 0
+
+addSharingResult :: SharingInfoResult -> (SharedClosureInfo,ClosurePtr) -> SharingInfoResult
+addSharingResult (SharingInfoResult result_count) (cl_info,ptr) = SharingInfoResult $ Map.insertWith (<>) cl_info (SharingSample (Set.singleton ptr) 1) result_count
 
 -- traverseSubClosures
 traverseSubClosures :: (Quintraversable m, Applicative f)
@@ -128,8 +151,8 @@ pAnalyzeNestedClosureFreeVars e = do
     -- since I got tired of threading state below...
     mutState <- liftIO $ newMVar (mempty :: Map.Map InfoTablePtr Int)
 
-    let info_roots = map (ClosurePtrWithInfo Nothing) roots
-    let traceFunctions :: TraceFunctionsIO (Maybe SharingInfoResult) (SharingInfoResult)
+    let info_roots = map (ClosurePtrWithInfo ()) roots
+    let traceFunctions :: TraceFunctionsIO () (SharingInfoResult)
         traceFunctions = (emptyTraceFunctionsIO (const mempty)) {closTrace = parClosTraceFunc mutState}
     hist
       --  <- traceParFromM emptyTraceFunctions{closTrace = parClosTraceFunc mutState} roots
@@ -139,7 +162,7 @@ pAnalyzeNestedClosureFreeVars e = do
     let intestingHistData = Map.filterWithKey
                               (\(SharedClosureInfo our_ptrs in_parent _is_thunk _par_tbl _itbls _fvs) count ->
                                   -- Ignore results that only occur once
-                                  count > 1 &&
+                                  (sample_count count) > 1 &&
                                   -- Ignore results that don't allow sharing
                                   in_parent > 0 &&
                                   -- There is no point in sharing a single pointer
@@ -150,44 +173,47 @@ pAnalyzeNestedClosureFreeVars e = do
     do
       liftIO $ putStrLn "==========================="
       liftIO $ putStrLn "== Sharing histogram"
-      let sorted_data = reverse $ sortOn (\(SharedClosureInfo{ shared_with_parent = shared},count)-> shared * count ) $ Map.toList intestingHistData
-      let analyze_one ptr_sum ((SharedClosureInfo
+      let sorted_data = reverse $ sortOn (\(SharedClosureInfo{ shared_with_parent = shared},sample_data)-> shared * (sample_count sample_data) ) $ Map.toList intestingHistData
+      let reportOne ptr_sum ((SharedClosureInfo
               { ptrs = our_ptrs
               , shared_with_parent = in_parent
               -- , is_thunk
               , par_itbl
               , child_itbl
-              , fv_info}),count) = do
+              , fv_info = _}),sample_data) = do
             -- We need one ptr to point at the parent so at best we can save count * (in_parent-1)
-            let max_ptrs_saved = (count * (in_parent-1))
+            let max_ptrs_saved = ((sample_count sample_data) * (in_parent-1))
             let get_loc itbl = getSourceInfo $ tableId itbl
             prnt_loc <- get_loc par_itbl
             chld_loc <- get_loc child_itbl
                             -- Basic info
-            liftIO $ putStrLn $ "ptrs:" <> show our_ptrs <> " shared_ptrs:" <> show in_parent <> " ptrs saved potential:" <> show max_ptrs_saved <> "(wds)" <>
-                            -- Info about free variables
-                                -- " fv_infos:" <> show fv_info <>
-                                " parent:"<> maybe "" show prnt_loc <>
-                                " child:"<> maybe "" show chld_loc
+            liftIO $ putStrLn $
+                "parent:"<> maybe "" show prnt_loc <>
+                "\n\tchild:"<> maybe "" show chld_loc <>
+                "\n\tsamples:"<> show sample_data <>
+                -- Info about free variables
+                -- "\n\tfv_infos:" <> show fv_info <>
+                "\n\tptrs:" <> show our_ptrs <> " shared_ptrs:" <> show in_parent <> " ptrs saved potential:" <> show max_ptrs_saved <> "(wds)"
+            -- analyzePathsTo roots (head $ (Set.elems $ sample_samples sample_data) )
             return $ ptr_sum + max_ptrs_saved
-      max_saved <- foldM analyze_one 0 sorted_data
+      max_saved <- foldM reportOne 0 sorted_data
       liftIO $ putStrLn $ "Max wds saved: " <> show max_saved <> show " (" <> show (div (max_saved*8) (1024^(2::Int))) <> "MB)"
 
   where
     parClosTraceFunc :: mut_state_
                   -> ClosurePtr
                   -> (DebugClosureWithExtra x b d g i ClosurePtr)
-                  -> Maybe SharingInfoResult
-                  -> DebugM (Maybe SharingInfoResult,SharingInfoResult, DebugM () -> DebugM ())
-    parClosTraceFunc _mutState parentPtr (DCS _ parentClos) partial_result = do
+                  -> ()
+                  -> DebugM ((),SharingInfoResult, DebugM () -> DebugM ())
+    parClosTraceFunc _mutState parentPtr (DCS _ parentClos) _partial_result = do
         child_infos <-
                 if (isFunLike parentClos || analyzeAllClosureTypes)
                     then analyzeOneClosure parentPtr parentClos
                     else pure []
 
-        let sharing_info = foldl' addSharingResult (fromMaybe mempty partial_result) child_infos
+        let sharing_info = foldl' addSharingResult (mempty) child_infos
 
-        return (Just sharing_info, sharing_info, id)
+        return ((), sharing_info, id)
 
 -- Do we want to analyze all closure types, regardless of whether they are function-like?
 analyzeAllClosureTypes :: Bool
@@ -214,7 +240,21 @@ getAllPtrs clos = flip execStateT mempty $
           ptrs <- get
           put $! Set.insert ptr ptrs
 
-analyzeOneClosure :: p -> DebugClosure b d g i ClosurePtr -> DebugM [SharedClosureInfo]
+-- This is hugely expensive. Use with care.
+analyzePathsTo :: [ClosurePtr] -> ClosurePtr -> DebugM ()
+analyzePathsTo roots ptr = do
+  paths <- findRetainers (Just 2) roots (\p _ -> return (p == ptr))
+  liftIO $ putStrLn $ ("Found paths to " <> show ptr <> "\n")
+  forM_ paths $ \path -> do
+    liftIO $ putStrLn "Path: "
+    forM_ path $ \node -> do
+        clos <- dereferenceClosure node
+        loc <- getSourceLoc clos
+        liftIO $ putStr $ "\n\t-> " <> (case infoPosition <$> loc of
+            Just loc_str -> loc_str
+            Nothing -> show (clos,loc))
+
+analyzeOneClosure :: p -> DebugClosure b d g i ClosurePtr -> DebugM [(SharedClosureInfo,ClosurePtr)]
 analyzeOneClosure _parentPtr parentClos = do
     let parent_itbl = info parentClos
 
@@ -249,6 +289,6 @@ analyzeOneClosure _parentPtr parentClos = do
                         child_itbl = child_itbl,
                         fv_info = fv_info_set
                         }
-                    let !histData = this_data : childFieldsHist_toAdd
+                    let !histData = (this_data,toPtr) : childFieldsHist_toAdd
                     put $! histData
 ----------------------------------------------------------
