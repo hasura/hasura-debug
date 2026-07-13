@@ -73,7 +73,7 @@ main :: IO ()
 main = do 
   hSetBuffering stdout NoBuffering 
   getArgs >>= \case
-     ("--analyze-snapshot":limDirty:mbFile) -> do
+     ("--analyze-snapshot":prog:limDirty:mbFile) -> do
        let file = case mbFile of
                     [f] -> f
                     []  -> defaultSnapshotLocation
@@ -83,16 +83,18 @@ main = do
            lim | limI == 0 = Nothing
                | otherwise = Just limI
        snapshotRun file $
-         -- pRetainingThunks
-         -- pDominators lim
-         -- pFragmentation
-         -- pClusteredHeapGML (ClusterBySourceInfo False) "/tmp/per-infoTable-byLoc-NEW"
-         -- pAnalyzePointerCompression
-         -- pAnalyzeNestedClosureFreeVars
-         -- pInfoTableTree
-         -- pDistinctInfoTableAnalysis
-         pCommonPtrArgs True
-         -- pPointersToPointers
+         case prog of
+             "RetainingThunks" -> pRetainingThunks
+             "Dominators" -> pDominators lim
+             "Fragmentation" -> pFragmentation
+             "ClusteredHeapGML" -> pClusteredHeapGML (ClusterBySourceInfo False) "/tmp/per-infoTable-byLoc-NEW"
+             "AnalyzePointerCompression" -> pAnalyzePointerCompression
+             "AnalyzeNestedClosureFreeVars" -> pAnalyzeNestedClosureFreeVars
+             "InfoTableTree" -> pInfoTableTree
+             "DistinctInfoTableAnalysis" -> pDistinctInfoTableAnalysis
+             "CommonPtrArgs" -> pCommonPtrArgs True
+             "PointersToPointers" -> pPointersToPointers
+             _ -> error "That ain't it!"
 
      ("--take-snapshot":mbSocket) -> do
        let sockPath = case mbSocket of
@@ -141,13 +143,13 @@ pFragmentation e = do
         [ ] -> liftIO $ print "no retainers... why?"
         [_,_] -> liftIO $ print "two retainers, skipping"
         [r] -> do
-          cs <- dereferenceClosures r
-          cs' <- mapM (quintraverse pure pure dereferenceConDesc pure pure) cs
-          locs <- mapM getSourceLoc cs'
+          r `seq` liftIO $ putStrLn "FIXME for 0.4!"
+          -- cs <- dereferenceClosures r
+          -- cs' <- mapM (quintraverse pure pure dereferenceConDesc pure pure) cs
+          -- locs <- mapM getSourceLoc cs'
           -- displayRetainerStack is arbitrary and weird...
           -- TODO could be cool to look for the last thunk in the list (highest up in retainer tree)
           -- TODO would be cool to call out the top-most line from our own codebase too
-          liftIO $ putStrLn "FIXME for 0.4!"
           -- liftIO $ displayRetainerStack 
           --   [ ("", zip cs' locs) ]
 
