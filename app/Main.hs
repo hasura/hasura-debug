@@ -87,11 +87,11 @@ main = do
          -- pDominators lim
          -- pFragmentation
          -- pClusteredHeapGML (ClusterBySourceInfo False) "/tmp/per-infoTable-byLoc-NEW"
-         pAnalyzePointerCompression
+         -- pAnalyzePointerCompression
          -- pAnalyzeNestedClosureFreeVars
          -- pInfoTableTree
          -- pDistinctInfoTableAnalysis
-         -- pCommonPtrArgs
+         pCommonPtrArgs True
          -- pPointersToPointers
 
      ("--take-snapshot":mbSocket) -> do
@@ -1000,7 +1000,7 @@ pAnalyzePointerCompression e = do
               bucket = (offsetFromPtrBucket toPtr, numFieldsBucket)
 
      -- TODO : 5 bytes + 3 bytes, where each of six nibbles represents size (in words) of successive children?? (16 words max each)
-      let !histSiblingOffs' = case toPtrs of
+      let !histSiblingOffs' = case reverse toPtrs of
               [] -> histSiblingOffs
               (toPtr0:toPtrsN) -> foldl' (flip go) histSiblingOffs toPtrsN where
                  go toPtr = Map.insertWith (+) bucket 1 where
@@ -1273,8 +1273,10 @@ insertFrequentElems FrequentElems{..} a =
 
 -- For each closure type (i.e. grouping by info pointer), How many of these
 -- exist with the same pointer arguments?
-pCommonPtrArgs :: Debuggee -> IO ()
-pCommonPtrArgs e = do
+--
+-- `pCommonPtrArgs True` means just inspect the first pointer
+pCommonPtrArgs :: Bool -> Debuggee -> IO ()
+pCommonPtrArgs justFirstPointerArg e = do
   pause e
   runTrace e $ do
     _bs <- precacheBlocks
@@ -1322,12 +1324,15 @@ pCommonPtrArgs e = do
     cacheSize = 4
     frequencySingleton = insertFrequentElems (emptyFrequentElems cacheSize)
 
+    maybeJustFirst | justFirstPointerArg = take 1
+                   | otherwise = id
+
     -- get the potentially-frequent pointer arguments, by info table entry
     traceFreqCandidates _ (DCS _ clos) continue = do
       freqElemsMap <- get
       let (InfoTablePtr iptr) = tableId $ info clos
       -- child pointers of closure
-      toPtrs <- fmap reverse $ lift $ flip execStateT [] $
+      toPtrs <- fmap (maybeJustFirst . reverse) $ lift $ flip execStateT [] $
           void $ flip (quintraverse pure pure pure pure) clos $ \toPtr-> do
               stack <- get
               put (toPtr:stack)
@@ -1344,7 +1349,7 @@ pCommonPtrArgs e = do
       mp <- get
       let (InfoTablePtr iptr) = tableId $ info clos
       -- child pointers of closure
-      toPtrs <- fmap reverse $ lift $ flip execStateT [] $
+      toPtrs <- fmap (maybeJustFirst . reverse) $ lift $ flip execStateT [] $
           void $ flip (quintraverse pure pure pure pure) clos $ \toPtr-> do
               stack <- get
               put (toPtr:stack)
