@@ -28,7 +28,7 @@ import Control.Monad.State
 -- import GHC.Exts.Heap.ClosureTypes
 import qualified Data.Foldable as F
 
--- import Control.Monad
+import Control.Monad
 -- import Debug.Trace
 import Control.Exception
 import Control.Concurrent
@@ -46,7 +46,7 @@ import Data.Word
 -- import System.Process
 import System.Environment
 import System.IO
-import Data.Tree
+import Data.Tree hiding (edges)
 import Data.Maybe
 import Data.Either
 import Control.Arrow (first, (***), (&&&))
@@ -145,7 +145,7 @@ pFragmentation e = do
         [r] -> do
           r `seq` liftIO $ putStrLn "FIXME for 0.4!"
           -- cs <- dereferenceClosures r
-          -- cs' <- mapM (quintraverse pure pure dereferenceConDesc pure pure) cs
+          -- cs' <- mapM (hextraverse pure pure pure dereferenceConDesc pure pure) cs
           -- locs <- mapM getSourceLoc cs'
           -- displayRetainerStack is arbitrary and weird...
           -- TODO could be cool to look for the last thunk in the list (highest up in retainer tree)
@@ -254,7 +254,7 @@ pWriteToGML path e = do
           -- Map over this closure's pointer arguments, recording an edge in
           -- our closure graph
           let sendEdge = Bounded.writeChan ioChanW . GMLEdge ptr
-          void $ quintraverse pure pure pure pure sendEdge clos
+          void $ hextraverse pure pure pure pure pure sendEdge clos
       continue
 -}
 
@@ -505,11 +505,14 @@ nullInfoTablePtr :: InfoTablePtr
 nullInfoTablePtr = InfoTablePtr 0
 
 
+-- TODO check out GHC.Debug.ParTrace everywhere we use `traceFromM`
 -- TODO add to ghc-debug
 emptyTraceFunctions :: (MonadTrans m, Monad (m DebugM))=> TraceFunctions m
 emptyTraceFunctions =
   TraceFunctions {
        papTrace = const (lift $ return ())
+     -- cost-centre stack:
+     , ccsTrace = \_ _ -> (lift $ return ())
      , srtTrace = const (lift $ return ())
      , stackTrace = const (lift $ return ())
      , closTrace = \_ _ -> id -- ^ Just recurse
@@ -520,7 +523,7 @@ emptyTraceFunctions =
 -- TODO add to ghc-debug
 deriving instance MonadIO DebugM
 
-getSourceLoc :: DebugClosureWithSize srt pap string s b -> DebugM (Maybe SourceInformation) 
+getSourceLoc :: DebugClosureWithSize ccs srt pap string s b -> DebugM (Maybe SourceInformation) 
 getSourceLoc c = getSourceInfo (tableId (info (noSize c)))
 
 -- ================================================================================
@@ -678,7 +681,7 @@ pClusteredHeapGML clusteringStrategy pathNoExtension e = do
           -- Here we go one hop further to build (possibly to an already-visited 
           -- node which we wouldn't be able to reach via traceFromM)
           -- TODO this is probably slow, since we need to resolve the InfoTablePtr again to make an edge
-          void $ flip (quintraverse pure pure pure pure) clos $ \toPtr-> do
+          void $ flip (hextraverse pure pure pure pure pure) clos $ \toPtr-> do
             (DCS _ toClos) <- lift $ dereferenceClosure toPtr
             let tidTarget = tableId $ info toClos
             -- Increase edge count tid -> tidTo by one, else add new edge
@@ -979,7 +982,7 @@ pAnalyzePointerCompression e = do
 
       toPtrs <- fmap reverse $ lift $ flip execStateT [] $
           -- Here we go one hop further to get this closure's pointers
-          void $ flip (quintraverse pure pure pure pure) clos $ \(UntaggedClosurePtr toPtr)-> do
+          void $ flip (hextraverse pure pure pure pure pure) clos $ \(UntaggedClosurePtr toPtr)-> do
               ptrStack <- get
               put (toPtr:ptrStack)
 
@@ -1135,7 +1138,7 @@ pAnalyzeNestedClosureFreeVars e = do
 
           (childPointersInParent, childFieldsHist_toAdd) <- lift $ flip execStateT (0, mempty) $
               -- for each of our pointers...
-              void $ flip (quintraverse pure pure pure pure) parentClos $ \ toPtr-> do
+              void $ flip (hextraverse pure pure pure pure pure) parentClos $ \ toPtr-> do
                 (!childPointersInParent, !childFieldsHist_toAdd) <- get
                 -- ...follow and collect child's pointers
                 (DCS _ childClos) <- lift $ dereferenceClosure toPtr
@@ -1167,7 +1170,7 @@ pAnalyzeNestedClosureFreeVars e = do
       _ -> False
 
     getAllPtrs clos = lift $ flip execStateT mempty $
-          void $ flip (quintraverse pure pure pure pure) clos $ \ ptr-> do
+          void $ flip (hextraverse pure pure pure pure pure) clos $ \ ptr-> do
               ptrs <- get
               put $! Set.insert ptr ptrs
 
@@ -1197,7 +1200,7 @@ pInfoTableTree e = do
 
       -- info pointers of each dereferenced child pointer
       toIptrs <- fmap reverse $ lift $ flip execStateT [] $
-          void $ flip (quintraverse pure pure pure pure) clos $ \toPtr-> do
+          void $ flip (hextraverse pure pure pure pure pure) clos $ \toPtr-> do
               stack <- get
               (DCS _ childClos) <- lift $ dereferenceClosure toPtr
               let (InfoTablePtr childIptr) = tableId $ info childClos
@@ -1335,7 +1338,7 @@ pCommonPtrArgs justFirstPointerArg e = do
       let (InfoTablePtr iptr) = tableId $ info clos
       -- child pointers of closure
       toPtrs <- fmap (maybeJustFirst . reverse) $ lift $ flip execStateT [] $
-          void $ flip (quintraverse pure pure pure pure) clos $ \toPtr-> do
+          void $ flip (hextraverse pure pure pure pure pure) clos $ \toPtr-> do
               stack <- get
               put (toPtr:stack)
 
@@ -1352,7 +1355,7 @@ pCommonPtrArgs justFirstPointerArg e = do
       let (InfoTablePtr iptr) = tableId $ info clos
       -- child pointers of closure
       toPtrs <- fmap (maybeJustFirst . reverse) $ lift $ flip execStateT [] $
-          void $ flip (quintraverse pure pure pure pure) clos $ \toPtr-> do
+          void $ flip (hextraverse pure pure pure pure pure) clos $ \toPtr-> do
               stack <- get
               put (toPtr:stack)
 
@@ -1392,7 +1395,7 @@ pPointersToPointers e = do
   where
     closTrace _ (DCS _ clos) continue = do
       -- how many child pointers are just dereference to pointers themselves?
-      void $ flip (quintraverse pure pure pure pure) clos $ \toPtr-> do
+      void $ flip (hextraverse pure pure pure pure pure) clos $ \toPtr-> do
         (pointersToPointersCount, pointersToDoubleWordCount) <- get
         (DCS (Size childSize) _) <- lift $ dereferenceClosure toPtr
         -- size should include info pointer, so this should work:

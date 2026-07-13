@@ -29,7 +29,7 @@ executable hasura-debug
 
     -- LANGUAGE extensions used by modules in this package.
     -- other-extensions:
-    build-depends:    base ^>=4.16.1.0,
+    build-depends:    base,
                       ghc-debug-client,
                       ghc-debug-common,
                       mtl,
@@ -45,13 +45,12 @@ executable hasura-debug
     ghc-options: -Wall -rtsopts -threaded "-with-rtsopts=-N"
                  -fdistinct-constructor-tables
                  -finfo-table-map
-                 -eventlog
 
 -- An example executable that can be analyzed
 executable example
     hs-source-dirs:   example
     main-is:          Main.hs
-    build-depends:    base ^>=4.16.1.0,
+    build-depends:    base,
                       ghc-debug-stub
     ghc-options: -Wall -rtsopts -threaded "-with-rtsopts=-N" -O2
     ghc-options: -fdistinct-constructor-tables -finfo-table-map
