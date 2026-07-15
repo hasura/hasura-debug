@@ -77,17 +77,18 @@ main = do
        let file = case mbFile of
                     [f] -> f
                     []  -> defaultSnapshotLocation
-                    _ -> error "bad args"
+                    _ -> error $ "bad args: "<> show mbFile
        -- zero indicates no limit:
        let limI = read limDirty
            lim | limI == 0 = Nothing
                | otherwise = Just limI
        snapshotRun file $
          case prog of
+             -- TODO expose options here to user from CLI:
              "RetainingThunks" -> pRetainingThunks
              "Dominators" -> pDominators lim
              "Fragmentation" -> pFragmentation
-             "ClusteredHeapGML" -> pClusteredHeapGML (ClusterBySourceInfo False) "/tmp/per-infoTable-byLoc-NEW"
+             "ClusteredHeapGML" -> pClusteredHeapGML (ClusterByInfoTable) (file <> "-clustered.gml")
              "AnalyzePointerCompression" -> pAnalyzePointerCompression
              "AnalyzeNestedClosureFreeVars" -> pAnalyzeNestedClosureFreeVars
              "InfoTableTree" -> pInfoTableTree
@@ -114,7 +115,7 @@ main = do
                    putStrLn $ "Snapshot created at: "<>defaultSnapshotLocation
        loop 1
 
-     _ -> error "bad args"
+     args -> error $ "bad args: "<> show args
   where
     go sockPath = withDebuggeeConnect sockPath $ \e -> do 
       makeSnapshot e defaultSnapshotLocation
