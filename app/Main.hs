@@ -97,6 +97,41 @@ main = do
              "PointersToPointers" -> pPointersToPointers
              _ -> error "That ain't it!"
 
+     -- Find retainer paths (from GC roots down to) every currently-live
+     -- closure whose source info matches a given (infoLabel, position
+     -- substring) pair -- i.e. the "name"/"pos" columns from our
+     -- ClusteredHeapGML dumps. Useful for pinpointing exactly *what* is
+     -- keeping a supposedly-superseded object graph (e.g. a stale
+     -- RebuildableSchemaCache generation) alive: point it at some closure
+     -- compiled from a spot inside that graph (e.g. "updateOperator" /
+     -- "Update.hs:174"), and if there are two live copies (one stale, one
+     -- current), you'll get two separate root-to-target paths to compare.
+     --
+     -- usage: --find-retainers-at <snapshotFile> <infoLabel> <posSubstring> [limit]
+     ("--find-retainers-at":file:targetLabel:targetPosSubstr:mbLimit) -> do
+       let limit = case mbLimit of
+             [] -> 10
+             [n] -> read n
+             _ -> error $ "bad args: " <> show mbLimit
+       snapshotRun file (pFindRetainersAt targetLabel targetPosSubstr limit)
+
+     -- Like --find-retainers-at, but reports EVERY independent retaining
+     -- path (up to a depth budget), not just the first one found -- see
+     -- Note [Single path per object]. Slower/more memory-hungry; best used
+     -- with a narrow, low-cardinality target (e.g. a specific record
+     -- constructor like "AppState" rather than a closure that occurs
+     -- thousands of times), once you specifically need to rule out a
+     -- second retaining reference to some object.
+     --
+     -- usage: --find-all-retainers-at <snapshotFile> <infoLabel> <posSubstring> [maxDepth] [maxPerLevel]
+     ("--find-all-retainers-at":file:targetLabel:targetPosSubstr:mbDepthAndPerLevel) -> do
+       let (maxDepth, maxPerLevel) = case mbDepthAndPerLevel of
+             [] -> (15, 30)
+             [n] -> (read n, 30)
+             [n, m] -> (read n, read m)
+             _ -> error $ "bad args: " <> show mbDepthAndPerLevel
+       snapshotRun file (pFindAllRetainersAt targetLabel targetPosSubstr maxDepth maxPerLevel)
+
      ("--take-snapshot":mbSocket) -> do
        let sockPath = case mbSocket of
              [] -> "/tmp/ghc-debug" 
@@ -211,6 +246,199 @@ pRetainingThunks e = do
            -- Note a thunk or else thunkDepthLim exceeded:
            put (sizeAcc+size, thunkDepth)
            continue
+
+-- | Matches a target the way a human would pick it off a ClusteredHeapGML
+-- dump or a printed retainer stack, against whichever of these the closure
+-- actually has:
+--
+--   * 'infoLabel' -- the "name" GML attribute, the enclosing binding, e.g.
+--     a function like "updateOperator".
+--   * 'infoType' -- the data type name for a constructor, e.g. "AppState"
+--     (NOT 'infoName' despite the name -- that's the full mangled info
+--     table symbol, e.g. "AppState_Hasura.Server.AppStateRef_3_con_info";
+--     'GHC.Debug.Retainers.displayRetainerStack'' prints
+--     infoName:infoType:infoModule:infoPosition in that order, which is
+--     easy to misread as infoName being the short name).
+--
+-- Also requires the position to contain the given substring (pass "" to
+-- match any position).
+matchesSourceInfo :: String -> String -> SourceInformation -> Bool
+matchesSourceInfo targetLabel targetPosSubstr si =
+  (infoLabel si == targetLabel || infoType si == targetLabel)
+    && targetPosSubstr
+    `isInfixOf` infoPosition si
+
+-- | Find retainer paths (from GC roots) to every currently-live closure
+-- whose source info matches the given 'infoLabel' exactly and whose
+-- 'infoPosition' contains the given substring -- these are the same "name"
+-- and "pos" GML node attributes written by 'pClusteredHeapGML' below, so a
+-- target can be picked directly from those dumps (or from
+-- *-clustered.gml-attributes CSVs).
+--
+-- Unlike ClusteredHeapGML (which folds every closure sharing an info table
+-- into a single node, losing per-object identity), this walks the real
+-- object graph and reports one path per distinct matching heap object -- so
+-- if two independent generations of some structure are simultaneously
+-- alive (e.g. a stale RebuildableSchemaCache plus the current one), you get
+-- two separate root-to-target paths whose divergence point tells you what's
+-- retaining the stale one.
+pFindRetainersAt :: String -> String -> Int -> Debuggee -> IO ()
+pFindRetainersAt targetLabel targetPosSubstr limit e = do
+  pause e
+  runTrace e $ do
+    _bs <- precacheBlocks
+    liftIO $ hPutStrLn stderr "!!!!! Done precacheBlocks !!!!!"
+    roots <- gcRoots
+    liftIO $ hPutStrLn stderr "!!!!! Done gcRoots !!!!!"
+    paths <- findRetainers (Just limit) matchesFilt roots
+    liftIO $ hPutStrLn stderr $ "!!!!! Found " <> show (length paths) <> " matching retainer path(s) !!!!!"
+    forM_ (zip [0 :: Int ..] paths) $ \(i, path) -> do
+      annotated <- addLocationToStack' path
+      liftIO $ do
+        putStrLn $ "=== match " <> show i <> " (path length " <> show (length path) <> ", target ... root) ==="
+        displayRetainerStack' [("", annotated)]
+  resume e
+  where
+    matchesFilt :: ClosureFilter
+    matchesFilt =
+      InfoSourceFilter
+        $ \si -> matchesSourceInfo targetLabel targetPosSubstr si
+
+-- | Note [Single path per object]
+-- ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+-- 'findRetainers' (used by 'pFindRetainersAt') is a single DFS/BFS over the
+-- heap with a *shared, global* visited-set (see 'GHC.Debug.Trace.traceFromM'
+-- / the no-op 'visitedVal' callback): once any closure has been reached via
+-- some path, it is never visited again, so if it's reachable via more than
+-- one independent reference, only whichever path the traversal happens to
+-- find first is ever reported. That's fine for "does anything retain this
+-- shape of closure at all", but it can silently hide a *second* retaining
+-- reference to a specific object -- which matters if you've already fixed
+-- one leak and want to know whether the object is still reachable some
+-- other way.
+--
+-- 'pFindAllRetainersAt' avoids this by doing its own full, un-clustered
+-- (real 'ClosurePtr' identity, not folded by info table like
+-- 'pClusteredHeapGML') single pass over the whole heap, recording every
+-- closure's raw outgoing pointer edges. It then inverts that into a
+-- reverse-adjacency map and walks *every* incoming edge, level by level, for
+-- each matching closure -- so multiple independent retainers of the same
+-- object all show up.
+--
+-- This is slower and more memory-hungry than 'pFindRetainersAt' (it visits
+-- and records edges for the whole heap rather than stopping early), so
+-- prefer 'pFindRetainersAt' first; reach for this specifically when you
+-- need to know whether a *specific* object has more than one retaining
+-- path, e.g. after fixing one suspected leak and wanting to confirm nothing
+-- else still holds the object alive.
+--
+-- Two safety valves, since an un-narrowed target can otherwise blow up:
+-- 'maxDepth' bounds how many levels up each match is walked, and
+-- 'maxPerLevel' caps how many nodes are *printed* per level (the walk
+-- itself still expands from every discovered parent regardless, so a wide
+-- level doesn't stop you from reaching a narrow, informative ancestor
+-- further up); see also 'maxMatchesWalked', which caps how many of the
+-- matching closures get walked at all.
+
+-- | A target matching more than this many closures is almost certainly too
+-- broad for this analysis (it's meant for pinning down a handful of
+-- suspect objects, not surveying a common shape) -- so by default we only
+-- walk ancestors for the first 'maxMatchesWalked' of them, and tell you so,
+-- rather than silently spending possibly a very long time (and a very
+-- large amount of output) walking all of them.
+maxMatchesWalked :: Int
+maxMatchesWalked = 20
+
+pFindAllRetainersAt :: String -> String -> Int -> Int -> Debuggee -> IO ()
+pFindAllRetainersAt targetLabel targetPosSubstr maxDepth maxPerLevel e = do
+  pause e
+  runTrace e $ do
+    _bs <- precacheBlocks
+    liftIO $ hPutStrLn stderr "!!!!! Done precacheBlocks !!!!!"
+    roots <- gcRoots
+    liftIO $ hPutStrLn stderr "!!!!! Done gcRoots !!!!!"
+
+    (fwdEdges, matches) <-
+      flip execStateT (Map.empty, [])
+        $ traceFromM emptyTraceFunctions {closTrace = closTraceFunc} roots
+
+    liftIO
+      $ hPutStrLn stderr
+      $ "!!!!! Scanned heap: "
+      <> show (Map.size fwdEdges)
+      <> " nodes, "
+      <> show (sum (map length (Map.elems fwdEdges)))
+      <> " raw edges, "
+      <> show (length matches)
+      <> " matching closure(s) !!!!!"
+
+    let revAdj :: Map.Map ClosurePtr [ClosurePtr]
+        revAdj =
+          Map.fromListWith
+            (++)
+            [(to_, [from_]) | (from_, tos) <- Map.toList fwdEdges, to_ <- tos]
+
+        (toWalk, skipped) = splitAt maxMatchesWalked matches
+
+    unless (null skipped)
+      $ liftIO
+      $ hPutStrLn stderr
+      $ "!!!!! "
+      <> show (length skipped)
+      <> " matching closure(s) not walked (target is too broad for --find-all-retainers-at;"
+      <> " narrow the label/position, or use --find-retainers-at instead) !!!!!"
+
+    forM_ (zip [0 :: Int ..] toWalk) $ \(i, m) -> do
+      liftIO $ putStrLn $ "=== match " <> show i <> " (" <> show m <> "); retainers up to " <> show maxDepth <> " levels up ==="
+      walkUp revAdj maxDepth (Set.singleton m) [m]
+  resume e
+  where
+    closTraceFunc ::
+      ClosurePtr ->
+      SizedClosure ->
+      StateT (Map.Map ClosurePtr [ClosurePtr], [ClosurePtr]) DebugM () ->
+      StateT (Map.Map ClosurePtr [ClosurePtr], [ClosurePtr]) DebugM ()
+    closTraceFunc ptr (DCS _ clos) continue = do
+      mbSi <- lift $ getSourceInfo (tableId (info clos))
+      let isMatch = case mbSi of
+            Just si -> matchesSourceInfo targetLabel targetPosSubstr si
+            Nothing -> False
+      outPtrs <-
+        lift
+          $ flip execStateT []
+          $ void
+          $ flip (hextraverse pure pure pure pure pure) clos
+          $ \toPtr -> modify' (toPtr :) >> pure toPtr
+      modify' (\(edges, ms) -> (Map.insert ptr outPtrs edges, if isMatch then ptr : ms else ms))
+      continue
+
+    -- BFS up the reverse-adjacency map, printing each level's distinct
+    -- nodes (deduped against everything already seen, to terminate on
+    -- cycles/diamonds), annotated with source info where available.
+    --
+    -- Only the *display* is capped at maxPerLevel (with an explicit count
+    -- of what was dropped) -- the traversal itself still expands from every
+    -- discovered parent, so a wide level doesn't stop you from reaching a
+    -- narrow, informative ancestor further up.
+    walkUp :: Map.Map ClosurePtr [ClosurePtr] -> Int -> Set.Set ClosurePtr -> [ClosurePtr] -> DebugM ()
+    walkUp revAdj depth seen frontier
+      | depth <= 0 || null frontier = pure ()
+      | otherwise = do
+          let (shown, hidden) = splitAt maxPerLevel frontier
+          annotated <- addLocationToStack' shown
+          liftIO $ do
+            putStrLn $ "--- level (depth budget " <> show depth <> "): " <> show (length frontier) <> " node(s) ---"
+            displayRetainerStack' [("", annotated)]
+            unless (null hidden)
+              $ putStrLn
+              $ "    ... ("
+              <> show (length hidden)
+              <> " more node(s) at this level not shown; raise maxPerLevel to see them)"
+          let nextSet =
+                Set.fromList (concatMap (\p -> Map.findWithDefault [] p revAdj) frontier)
+                  `Set.difference` seen
+              next = Set.toList nextSet
+          walkUp revAdj (depth - 1) (Set.union seen nextSet) next
 
 ----------------------------------------
 -- TODO this is still non-working for GML, in that we need GML node ids to be int32 ... :(
