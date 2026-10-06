@@ -13,7 +13,7 @@ import GHC.Debug.Snapshot
 -- import GHC.Debug.Count
 -- import GHC.Debug.Types.Graph (heapGraphSize, traverseHeapGraph, ppClosure)
 import GHC.Debug.Types.Ptr
---import GHC.Debug.Types.Closures
+import GHC.Debug.Types.Closures (DebugClosure(ArrWordsClosure))
 import GHC.Debug.Trace
 -- import GHC.Debug.ObjectEquiv
 import Control.Monad.RWS
@@ -40,6 +40,7 @@ import qualified Data.IntMap.Strict as IM
 -- import Control.Applicative
 -- import Data.Traversable
 import Data.Kind
+import Data.Bits (shiftR, (.&.))
 import Data.Tuple
 import Data.Word
 
@@ -95,6 +96,11 @@ main = do
              "DistinctInfoTableAnalysis" -> pDistinctInfoTableAnalysis
              "CommonPtrArgs" -> pCommonPtrArgs True
              "PointersToPointers" -> pPointersToPointers
+             "DupClosures" -> pDupClosures
+             "SizeBreakdown" -> pSizeBreakdown
+             "ThunkCensus" -> pThunkCensus
+             "InfoTableCensus" -> pInfoTableCensus
+             "AnonClosure2" -> pAnonClosure2
              _ -> error "That ain't it!"
 
      -- Find retainer paths (from GC roots down to) every currently-live
@@ -1633,4 +1639,393 @@ pPointersToPointers e = do
           put $! (pointersToPointersCount + 1, pointersToDoubleWordCount)
         when (childSize == 16) $
           put $! (pointersToPointersCount, pointersToDoubleWordCount+1)
+      continue
+
+
+----------------------------------------------------------
+
+-- ================================================================================
+-- | Identify what the anonymous (no-source-info) CONSTR_2_0 closures actually are.
+--
+-- Strategy: for every CONSTR_2_0 with no source info, dereference its two child
+-- pointers and record the source-info (or closure type) of each child.  Group
+-- by (child1_label, child2_label) to surface patterns like:
+--   "(Text, SchemaData)"  →  probably HashMap Leaf nodes
+--   "(Array, Array)"      →  probably HashMap BitmapIndexed nodes
+--   "(cons, cons)"        →  list spine
+--   etc.
+--
+-- Also separates CONSTR_2_0 with source info vs. without to calibrate totals.
+pAnonClosure2 :: Debuggee -> IO ()
+pAnonClosure2 e = do
+  pause e
+  runTrace e $ do
+    _bs <- precacheBlocks
+    liftIO $ hPutStrLn stderr "Done precacheBlocks"
+    roots <- gcRoots
+    liftIO $ hPutStrLn stderr "Done gcRoots, walking heap..."
+
+    -- state: (child1_label, child2_label) -> (count, total_bytes)
+    mp <- flip execStateT (Map.empty :: Map.Map (String, String) (Int, Int)) $
+      traceFromM emptyTraceFunctions {closTrace = closTraceFunc} roots
+
+    liftIO $ hPutStrLn stderr "Done walking."
+
+    let sorted = take 60 $ sortBy (flip compare `on` snd) $ Map.toList mp
+        total  = sum $ map snd $ Map.elems mp
+
+    liftIO $ do
+      putStrLn $ "=== Anonymous CONSTR_2_0 child-pair distribution ==="
+      putStrLn $ "Total (count, bytes) across all pairs: " <> show total
+      putStrLn $ replicate 80 '-'
+      forM_ sorted $ \((c1, c2), (cnt, bytes)) ->
+        putStrLn $ "  " <> rjust 8 (show (bytes `div` 1000)) <> " KB"
+                      <> "  x" <> rjust 8 (show cnt)
+                      <> "  child1=" <> c1
+                      <> "  child2=" <> c2
+
+  resume e
+  where
+    rjust n s = replicate (max 0 (n - length s)) ' ' <> s
+
+    -- summarise what a closure pointer points to
+    childLabel :: ClosurePtr -> DebugM String
+    childLabel cp = do
+      (DCS _ clos) <- dereferenceClosure cp
+      let iptr   = tableId $ info clos
+          ctypeS = show $ tipe $ decodedTable $ info clos
+      mbSI <- getSourceInfo iptr
+      pure $ case mbSI of
+        Nothing -> ctypeS
+        Just SourceInformation{..} ->
+          infoType <> "@" <> infoModule <> "/" <> infoLabel
+
+    closTraceFunc _ (DCS (Size sz) clos) continue = do
+      let iptr   = tableId $ info clos
+          ctype  = tipe $ decodedTable $ info clos
+      when (ctype == CONSTR_2_0) $ do
+        mbSI <- lift $ getSourceInfo iptr
+        case mbSI of
+          Just _  -> pure ()   -- has source info — skip, we know what it is
+          Nothing -> do
+            -- collect the two child pointers
+            children <- lift $ flip execStateT [] $
+              void $ flip (hextraverse pure pure pure pure pure) clos $
+                \cp -> modify' (cp :)
+            case reverse children of
+              [c1, c2] -> do
+                l1 <- lift $ childLabel c1
+                l2 <- lift $ childLabel c2
+                let addPair (a1,b1) (a2,b2) = (a1+a2, b1+b2)
+                modify' $ Map.insertWith addPair (l1, l2) (1, sz)
+              _ -> pure ()   -- unexpected number of children; skip
+      continue
+
+-- ================================================================================
+-- | Break down heap residency by closure type and by module.
+--
+-- Closure-type report: how many MB are in CONSTR vs FUN vs THUNK vs ARR_WORDS, etc.
+-- Module report: which Haskell modules own the most heap data.
+--
+-- Together these answer "what kind of data is taking up space, and where does it come from?"
+pSizeBreakdown :: Debuggee -> IO ()
+pSizeBreakdown e = do
+  pause e
+  runTrace e $ do
+    _bs <- precacheBlocks
+    liftIO $ hPutStrLn stderr "Done precacheBlocks"
+    roots <- gcRoots
+    liftIO $ hPutStrLn stderr "Done gcRoots, walking heap..."
+
+    -- state: (ctype_str, module_str) -> (count, total_bytes)
+    mp <- flip execStateT (Map.empty :: Map.Map (String, String) (Int, Int)) $
+      traceFromM emptyTraceFunctions {closTrace = closTraceFunc} roots
+
+    liftIO $ hPutStrLn stderr "Done walking."
+
+    let addPair (c1, b1) (c2, b2) = (c1 + c2, b1 + b2)
+        byType = Map.fromListWith addPair
+          [((ct, ()), p) | ((ct, _m), p) <- Map.toList mp]
+        byMod  = Map.fromListWith addPair
+          [(( (), m), p) | ((_ct, m),  p) <- Map.toList mp]
+        totalBytes = sum $ map snd $ Map.elems byType
+        sortedByBytes = sortBy (flip compare `on` snd)
+
+    liftIO $ do
+      putStrLn $ "\n=== Heap size by closure type  (total tracked: "
+                   <> show (totalBytes `div` 1_000_000) <> " MB) ==="
+      forM_ (sortedByBytes $ Map.toList byType) $ \((ct, ()), (cnt, bytes)) ->
+        putStrLn $ "  " <> rjust 8 (show (bytes `div` 1000)) <> " KB"
+                      <> "  x" <> rjust 8 (show cnt)
+                      <> "  " <> ct
+
+      putStrLn "\n=== Heap size by module (top 50) ==="
+      forM_ (take 50 $ sortedByBytes $ Map.toList byMod) $ \(((), m), (cnt, bytes)) ->
+        putStrLn $ "  " <> rjust 8 (show (bytes `div` 1000)) <> " KB"
+                      <> "  x" <> rjust 8 (show cnt)
+                      <> "  " <> m
+
+  resume e
+  where
+    rjust n s = replicate (max 0 (n - length s)) ' ' <> s
+
+    closTraceFunc _ (DCS (Size sz) clos) continue = do
+      let iptr   = tableId $ info clos
+          ctypeS = show $ tipe $ decodedTable $ info clos
+      mbSI <- lift $ getSourceInfo iptr
+      let modS = case mbSI of
+            Nothing -> "(no source info)"
+            Just si -> infoModule si
+      modify' $ Map.insertWith addPair (ctypeS, modS) (1, sz)
+      continue
+      where addPair (c1, b1) (c2, b2) = (c1 + c2, b1 + b2)
+
+-- ================================================================================
+-- | Census of every live thunk, grouped by source location, sorted by total bytes.
+--
+-- This is complementary to profiling: a profiler shows where thunks are ALLOCATED;
+-- this shows which thunks are still ALIVE at snapshot time (retained in the schema
+-- cache or other long-lived structures). These are the ones worth adding bangs to.
+pThunkCensus :: Debuggee -> IO ()
+pThunkCensus e = do
+  pause e
+  runTrace e $ do
+    _bs <- precacheBlocks
+    liftIO $ hPutStrLn stderr "Done precacheBlocks"
+    roots <- gcRoots
+    liftIO $ hPutStrLn stderr "Done gcRoots, walking heap..."
+
+    -- state: source_loc_str -> (count, total_bytes)
+    mp <- flip execStateT (Map.empty :: Map.Map String (Int, Int)) $
+      traceFromM emptyTraceFunctions {closTrace = closTraceFunc} roots
+
+    liftIO $ hPutStrLn stderr "Done walking."
+
+    let sorted = take 80 $ sortBy (flip compare `on` snd) $ Map.toList mp
+        totalCnt   = sum $ map (fst . snd) $ Map.toList mp
+        totalBytes = sum $ map (snd . snd) $ Map.toList mp
+
+    liftIO $ do
+      putStrLn $ "=== Live Thunk Census ==="
+      putStrLn $ "Total live thunks: " <> show totalCnt
+                   <> "  (" <> show (totalBytes `div` 1_000_000) <> " MB)"
+      putStrLn ""
+      putStrLn "Top 80 sites by total bytes retained in thunk closures:"
+      putStrLn $ replicate 80 '-'
+      forM_ sorted $ \(loc, (cnt, bytes)) ->
+        putStrLn $ "  " <> rjust 7 (show (bytes `div` 1000)) <> " KB"
+                      <> "  x" <> rjust 7 (show cnt)
+                      <> "  " <> loc
+
+  resume e
+  where
+    rjust n s = replicate (max 0 (n - length s)) ' ' <> s
+
+    thunkTypes = [ THUNK, THUNK_1_0, THUNK_0_1, THUNK_2_0, THUNK_1_1
+                 , THUNK_0_2, THUNK_STATIC, THUNK_SELECTOR ]
+
+    closTraceFunc _ (DCS (Size sz) clos) continue = do
+      let iptr  = tableId $ info clos
+          ctype = tipe $ decodedTable $ info clos
+      when (ctype `elem` thunkTypes) $ do
+        mbSI <- lift $ getSourceInfo iptr
+        let loc = case mbSI of
+              Nothing -> "(no source info / type=" <> show ctype <> ")"
+              Just SourceInformation{..} ->
+                infoModule <> "." <> infoLabel <> " @ " <> infoPosition
+        modify' $ Map.insertWith addPair loc (1, sz)
+      continue
+      where addPair (c1, b1) (c2, b2) = (c1 + c2, b1 + b2)
+
+-- ================================================================================
+-- | For every distinct info table, report the total bytes and closure count,
+-- sorted by total bytes (top 100).
+--
+-- Unlike DupClosures (which only counts physically-identical closures), this
+-- reports ALL closures of each kind -- so a call site with millions of distinct
+-- closures (each pointing to different children) will still appear here with
+-- its full byte count.  This answers "what code is responsible for the most
+-- heap data?" regardless of whether any of it is redundant.
+pInfoTableCensus :: Debuggee -> IO ()
+pInfoTableCensus e = do
+  pause e
+  runTrace e $ do
+    _bs <- precacheBlocks
+    liftIO $ hPutStrLn stderr "Done precacheBlocks"
+    roots <- gcRoots
+    liftIO $ hPutStrLn stderr "Done gcRoots, walking heap..."
+
+    -- state: InfoTablePtr -> (count, total_bytes, tipe_str)
+    mp <- flip execStateT (Map.empty :: Map.Map InfoTablePtr (Int, Int, String)) $
+      traceFromM emptyTraceFunctions {closTrace = closTraceFunc} roots
+
+    liftIO $ hPutStrLn stderr "Done walking."
+
+    let entries  = Map.toList mp
+        sorted   = take 100 $ sortBy (flip compare `on` \(_, (_, b, _)) -> b) entries
+        totalBytes = sum [b | (_, (_, b, _)) <- entries]
+
+    liftIO $ putStrLn $ "=== Info Table Census (top 100 by total bytes) ==="
+    liftIO $ putStrLn $ "Total tracked: " <> show (totalBytes `div` 1_000_000) <> " MB"
+    liftIO $ putStrLn $ replicate 80 '-'
+
+    forM_ sorted $ \(iptr, (cnt, bytes, ctypeS)) -> do
+      mbSI <- getSourceInfo iptr
+      liftIO $ do
+        let label = case mbSI of
+              Nothing -> "[" <> ctypeS <> ", iptr=" <> show iptr <> "]"
+              Just SourceInformation{..} ->
+                ctypeS <> " | " <> infoType <> " | " <> infoLabel <> " @ " <> infoPosition
+        putStrLn $ "  " <> rjust 8 (show (bytes `div` 1000)) <> " KB"
+                      <> "  x" <> rjust 8 (show cnt)
+                      <> "  " <> label
+
+  resume e
+  where
+    rjust n s = replicate (max 0 (n - length s)) ' ' <> s
+
+    closTraceFunc _ (DCS (Size sz) clos) continue = do
+      let iptr   = tableId $ info clos
+          ctypeS = show $ tipe $ decodedTable $ info clos
+      modify' $ Map.insertWith addT iptr (1, sz, ctypeS)
+      continue
+      where addT (c1, b1, t) (c2, b2, _) = (c1 + c2, b1 + b2, t)
+
+-- ================================================================================
+-- | Walk the heap and find closures whose (info-table, child-pointer-list) key
+-- is shared by more than one heap object.  Any such group could in principle be
+-- collapsed to a single allocation via hash-consing / interning.
+--
+-- Handles ARR_WORDS (ByteArray# / Text backing arrays) separately: groups them
+-- by actual word content rather than (non-existent) pointer children, so
+-- duplicates here are genuinely identical byte arrays.
+--
+-- For all other closures, inspects up to 'maxPtrs' pointer fields.  Only
+-- closures with ≥1 pointer field give a reliable equality signal; 0-pointer
+-- non-ARR_WORDS closures (e.g. boxed Int) are omitted entirely.
+--
+-- Reports the top groups sorted by wasted bytes = (count - 1) * size_per_copy.
+pDupClosures :: Debuggee -> IO ()
+pDupClosures e = do
+  pause e
+  runTrace e $ do
+    _bs <- precacheBlocks
+    liftIO $ hPutStrLn stderr "Done precacheBlocks"
+    roots <- gcRoots
+    liftIO $ hPutStrLn stderr "Done gcRoots, walking heap..."
+
+    -- Two maps collected in one pass:
+    --   ptrMap: (iptr, [child ptrs]) -> (count, size, closure-type string)  -- ≥1 ptr field
+    --   arrMap: (iptr, [words])      -> (count, size)                       -- ARR_WORDS only
+    (ptrMap, arrMap) <-
+      flip execStateT
+        ( Map.empty :: Map.Map (InfoTablePtr, [ClosurePtr]) (Int, Int, String)
+        , Map.empty :: Map.Map (InfoTablePtr, [Word]) (Int, Int)
+        ) $
+        traceFromM emptyTraceFunctions {closTrace = closTraceFunc} roots
+
+    liftIO $ hPutStrLn stderr $
+      "Done. ptr-keyed: " <> show (Map.size ptrMap)
+        <> "  arr-keyed: " <> show (Map.size arrMap)
+
+    -- ── Pointer-based duplicates ──────────────────────────────────────────
+    let ptrDupes =
+          [ (wasted, cnt, nPtrs, iptr, ctype)
+          | ((iptr, ptrs), (cnt, sz, ctype)) <- Map.toList ptrMap
+          , cnt > 1
+          , let wasted = (cnt - 1) * sz
+                nPtrs  = length ptrs
+          ]
+        ptrSorted   = sortBy (flip compare `on` \(w,_,_,_,_) -> w) ptrDupes
+        ptrTop      = take 60 ptrSorted
+        ptrWasted   = sum [w | (w,_,_,_,_) <- ptrDupes]
+
+    liftIO $ do
+      putStrLn $ "=== Duplicate Closure Analysis (pointer fields \x2264 " <> show maxPtrs <> ") ==="
+      putStrLn $ "Groups with >1 identical copy: " <> show (length ptrDupes)
+      putStrLn $ "Total bytes recoverable: " <> show ptrWasted
+                   <> " (" <> show (ptrWasted `div` (1000*1000)) <> " MB)"
+      putStrLn ""
+      putStrLn "Top 60 by wasted bytes:"
+      putStrLn $ replicate 80 '-'
+
+    forM_ ptrTop $ \(wasted, cnt, nPtrs, iptr, ctype) -> do
+      mbSI <- getSourceInfo iptr
+      liftIO $ do
+        let label = case mbSI of
+              Nothing -> "[" <> ctype <> ", iptr=" <> show iptr <> "]"
+              Just SourceInformation{..} ->
+                infoType <> " | " <> infoLabel <> " @ " <> infoPosition
+        putStrLn $ "  " <> show wasted <> " wasted  (x" <> show cnt <> ", " <> show nPtrs <> " ptrs)  " <> label
+
+    -- ── ARR_WORDS (content-based) duplicates ─────────────────────────────
+    let arrDupes =
+          [ (wasted, cnt, iptr, ws)
+          | ((iptr, ws), (cnt, sz)) <- Map.toList arrMap
+          , cnt > 1
+          , let wasted = (cnt - 1) * sz
+          ]
+        arrSorted = sortBy (flip compare `on` \(w,_,_,_) -> w) arrDupes
+        arrTop    = take 30 arrSorted
+        arrWasted = sum [w | (w,_,_,_) <- arrDupes]
+
+    liftIO $ do
+      putStrLn ""
+      putStrLn "=== Duplicate ARR_WORDS (content-compared: truly identical byte arrays) ==="
+      putStrLn $ "Groups with >1 identical copy: " <> show (length arrDupes)
+      putStrLn $ "Total bytes recoverable: " <> show arrWasted
+                   <> " (" <> show (arrWasted `div` (1000*1000)) <> " MB)"
+      putStrLn ""
+      putStrLn "Top 30 by wasted bytes (with ASCII preview of first ≤32 bytes):"
+      putStrLn $ replicate 80 '-'
+
+    forM_ arrTop $ \(wasted, cnt, iptr, ws) -> do
+      mbSI <- getSourceInfo iptr
+      liftIO $ do
+        let preview = previewWords ws
+            label   = case mbSI of
+              Nothing -> "[iptr=" <> show iptr <> "]"
+              Just SourceInformation{..} -> infoType <> " | " <> infoLabel
+        putStrLn $ "  " <> show wasted <> " wasted  (x" <> show cnt <> ")  "
+                      <> label <> "  \"" <> preview <> "\""
+
+  resume e
+  where
+    maxPtrs = 12
+
+    -- Decode the first ≤32 bytes of ARR_WORDS word content as printable ASCII
+    -- (little-endian byte order within each Word, replacing non-printable with '.')
+    previewWords :: [Word] -> String
+    previewWords ws =
+      let bytes = concatMap wordToBytes ws
+          wordToBytes w = [fromIntegral ((w `shiftR` sh) .&. 0xff) | sh <- [0, 8..56 :: Int]]
+          toChar b
+            | b >= 0x20 && b < 0x7f = toEnum b
+            | otherwise              = '.'
+       in map toChar (take 32 bytes)
+
+    closTraceFunc _ (DCS (Size sz) clos) continue = do
+      let iptr = tableId $ info clos
+      case clos of
+        -- ARR_WORDS: key by actual word content (reliable dedup)
+        ArrWordsClosure {arrWords} ->
+          modify' $ \(pm, am) ->
+            (pm, Map.insertWith (\_ (cnt, s) -> (cnt+1, s)) (iptr, arrWords) (1, sz) am)
+        -- Everything else: key by (iptr, child pointer list)
+        _ -> do
+          childPtrs <-
+            fmap reverse $
+              lift $
+                flip execStateT [] $
+                  void $
+                    flip (hextraverse pure pure pure pure pure) clos $
+                      \toPtr -> modify' (toPtr :)
+          -- Only record if ≥1 pointer field (0-ptr non-ARR_WORDS have no
+          -- meaningful equality signal) and within the size cap
+          when (not (null childPtrs) && length childPtrs <= maxPtrs) $
+            let ctype = show $ tipe $ decodedTable $ info clos
+             in modify' $ \(pm, am) ->
+                  ( Map.insertWith (\_ (cnt, s, t) -> (cnt+1, s, t)) (iptr, childPtrs) (1, sz, ctype) pm
+                  , am
+                  )
       continue
